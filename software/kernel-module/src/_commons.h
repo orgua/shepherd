@@ -1,10 +1,9 @@
-#ifndef SHEPHERD_COMMONS_H_
-#define SHEPHERD_COMMONS_H_
-// NOTE: a (almost) Copy of this definition-file exists for the kernel module (copy changes by hand)
-// NOTE: and most of the structs are hardcoded in read_buffer() in shepherd_io.py
+#ifndef __COMMONS_H_
+#define __COMMONS_H_
 
-#include "shepherd_config.h"
-#include "stdint_fast.h"
+#include "_shepherd_config.h"
+#include <linux/types.h>
+
 
 /* Message content description used to distinguish messages for PRU0 */
 enum MsgType
@@ -24,7 +23,7 @@ enum MsgType
     MSG_DBG_DAC                   = 0xA1u, // TODO: rename: MSG_CTRL_DAC
     MSG_DBG_GPI                   = 0xA2u,
     MSG_DBG_GP_BATOK              = 0xA3u,
-    MSG_DBG_PRINT                 = 0xA6u, // TODO: unused
+    MSG_DBG_PRINT                 = 0xA6u,
     MSG_DBG_VSRC_P_INP            = 0xA8u,
     MSG_DBG_VSRC_P_OUT            = 0xA9u,
     MSG_DBG_VSRC_V_CAP            = 0xAAu,
@@ -40,7 +39,7 @@ enum MsgType
     MSG_ERR_MEM_CORRUPTION        = 0xE1u,
     MSG_ERR_BACKPRESSURE          = 0xE2u,
     MSG_ERR_TIMESTAMP             = 0xE3u,
-    MSG_ERR_CANARY                = 0xE4u, // TODO: add report on canary violations
+    MSG_ERR_CANARY                = 0xE4u, // TODO: add canary violations
     MSG_ERR_SYNC_STATE_NOT_IDLE   = 0xE5u,
     MSG_ERR_VALUE                 = 0xE6u,
     MSG_ERR_SAMPLE_MODE           = 0xE7u,
@@ -58,8 +57,8 @@ enum MsgType
 /* Message IDs used in Mem-Msg-Protocol between PRUs and kernel module */
 enum MsgID
 {
-    MSG_TO_KERNEL = 0x55u,
-    MSG_TO_PRU    = 0xAAu,
+    MSG_TO_KERNEL = 0x55,
+    MSG_TO_PRU    = 0xAA
 };
 
 enum ShepherdMode
@@ -70,16 +69,15 @@ enum ShepherdMode
     MODE_EMULATOR     = 0x20u,
     MODE_EMU_ADC_READ = 0x21u,
     MODE_DEBUG        = 0xD0u,
-}; // TODO: allow to set "NONE", shuts down hrv & emu
+};
 
 enum ShepherdState
 {
     STATE_UNKNOWN = 0x00u,
     STATE_IDLE    = 0x10u,
-    STATE_ARMED   = 0x20u, // transitional state
-    // TODO: pru should switch to running when armed & ts>counter
+    STATE_ARMED   = 0x20u,
     STATE_RUNNING = 0x30u,
-    STATE_RESET   = 0xE0, // transitional state -> idle
+    STATE_RESET   = 0xE0,
     STATE_FAULT   = 0xF0,
 };
 
@@ -104,56 +102,8 @@ enum ProgrammerTarget
     PRG_TARGET_DUMMY  = 3u,
 };
 
-struct IVSample
-{
-    uint32_t voltage;
-    uint32_t current;
-} __attribute__((packed));
-
-extern uint32_t __cache_fits_buffer[1 / ((1u << ELEMENT_SIZE_LOG2) == sizeof(struct IVSample))];
-
-struct IVTraceInp
-{
-    uint32_t        idx_pru;
-    struct IVSample sample[BUFFER_IV_SIZE];
-    /* safety */
-    uint32_t        canary;
-} __attribute__((packed));
-
-struct IVTraceOut
-{
-    uint32_t idx_pru;
-    uint64_t timestamp_ns[BUFFER_IV_SIZE];
-    uint32_t voltage[BUFFER_IV_SIZE];
-    uint32_t current[BUFFER_IV_SIZE];
-    /* safety */
-    uint32_t canary;
-} __attribute__((packed));
-
-struct GPIOTrace
-{
-    uint32_t idx_pru;
-    uint64_t timestamp_ns[BUFFER_GPIO_SIZE];
-    uint16_t bitmask[BUFFER_GPIO_SIZE];
-    /* safety */
-    uint32_t canary;
-} __attribute__((packed));
-
-struct UtilTrace
-{
-    /* PRU0 utilization, max ticks per sample (10us), sum of ticks during one sync window (100ms) */
-    uint32_t idx_pru;
-    uint64_t timestamp_ns[BUFFER_UTIL_SIZE];
-    uint32_t pru0_tsample_ns_max[BUFFER_UTIL_SIZE];
-    uint32_t pru0_tsample_ns_sum[BUFFER_UTIL_SIZE];
-    uint32_t pru0_sample_count[BUFFER_UTIL_SIZE];
-    uint32_t pru1_tsample_ns_max[BUFFER_UTIL_SIZE];
-    /* safety */
-    uint32_t canary;
-} __attribute__((packed));
-
 /* Programmer-Control as part of SharedMem-Struct */
-struct ProgrammerCtrl
+struct ProgrammerCtrl // TODO: also rename to *Config?
 {
     int32_t  state;
     /* Target chip to be programmed */
@@ -168,9 +118,8 @@ struct ProgrammerCtrl
     uint32_t pin_tms;     // mode for JTAG
     uint32_t pin_dir_tms; // direction (HIGH == Output to target)
     /* safety */
-    uint32_t canary;
+    uint32_t canary;       // TODO: should these near structs have canaries in between?
 } __attribute__((packed)); // TODO: pin_X can be u8,
-
 
 /* calibration values - usage example: voltage_uV = adc_value * gain_factor + offset
  * numbers for hw-rev2.0
@@ -317,4 +266,5 @@ struct ProtoMsg64
     uint32_t canary;
 } __attribute__((packed));
 
-#endif /* SHEPHERD_COMMONS_H_ */
+
+#endif /* __COMMONS_H_ */

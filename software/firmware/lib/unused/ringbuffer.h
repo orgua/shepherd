@@ -4,6 +4,7 @@
 #include "commons.h"
 #include "stdint_fast.h"
 
+#define FIFO_BUFFER_SIZE (5u) // NOTE: just mocked
 
 struct RingBuffer
 {

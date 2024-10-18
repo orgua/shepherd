@@ -3,7 +3,8 @@
 #include <linux/string.h>
 #include <linux/sysfs.h>
 
-#include "commons.h"
+#include "_commons.h"
+#include "_shared_mem.h"
 #include "pru_firmware.h"
 #include "pru_mem_interface.h"
 #include "pru_msg_sys.h"
@@ -101,24 +102,34 @@ struct kobj_attr_struct_s
 
 struct kobj_attribute     attr_state = __ATTR(state, 0660, sysfs_state_show, sysfs_state_store);
 
-struct kobj_attr_struct_s attr_mem_base_addr = {
-        .attr       = __ATTR(address, 0660, sysfs_SharedMem_show, NULL),
-        .val_offset = offsetof(struct SharedMem, mem_base_addr)};
-struct kobj_attr_struct_s attr_mem_size  = {.attr = __ATTR(size, 0660, sysfs_SharedMem_show, NULL),
-                                            .val_offset = offsetof(struct SharedMem, mem_size)};
+struct kobj_attr_struct_s attr_buffer_iv_inp_ptr = {
+        .attr       = __ATTR(iv_inp_address, 0660, sysfs_SharedMem_show, NULL),
+        .val_offset = offsetof(struct SharedMem, buffer_iv_inp_ptr)};
+struct kobj_attr_struct_s attr_buffer_iv_inp_size = {
+        .attr       = __ATTR(iv_inp_size, 0660, sysfs_SharedMem_show, NULL),
+        .val_offset = offsetof(struct SharedMem, buffer_iv_inp_size)};
+struct kobj_attr_struct_s attr_buffer_iv_out_ptr = {
+        .attr       = __ATTR(iv_out_address, 0660, sysfs_SharedMem_show, NULL),
+        .val_offset = offsetof(struct SharedMem, buffer_iv_out_ptr)};
+struct kobj_attr_struct_s attr_buffer_iv_out_size = {
+        .attr       = __ATTR(iv_out_size, 0660, sysfs_SharedMem_show, NULL),
+        .val_offset = offsetof(struct SharedMem, buffer_iv_out_size)};
+struct kobj_attr_struct_s attr_buffer_gpio_ptr = {
+        .attr       = __ATTR(gpio_address, 0660, sysfs_SharedMem_show, NULL),
+        .val_offset = offsetof(struct SharedMem, buffer_gpio_ptr)};
+struct kobj_attr_struct_s attr_buffer_gpio_size = {
+        .attr       = __ATTR(gpio_size, 0660, sysfs_SharedMem_show, NULL),
+        .val_offset = offsetof(struct SharedMem, buffer_gpio_size)};
+struct kobj_attr_struct_s attr_buffer_util_ptr = {
+        .attr       = __ATTR(util_address, 0660, sysfs_SharedMem_show, NULL),
+        .val_offset = offsetof(struct SharedMem, buffer_util_ptr)};
+struct kobj_attr_struct_s attr_buffer_util_size = {
+        .attr       = __ATTR(util_size, 0660, sysfs_SharedMem_show, NULL),
+        .val_offset = offsetof(struct SharedMem, buffer_util_size)};
 
-struct kobj_attr_struct_s attr_n_buffers = {
-        .attr       = __ATTR(n_buffers, 0660, sysfs_SharedMem_show, NULL),
-        .val_offset = offsetof(struct SharedMem, n_buffers)};
-struct kobj_attr_struct_s attr_samples_per_buffer = {
-        .attr       = __ATTR(samples_per_buffer, 0660, sysfs_SharedMem_show, NULL),
-        .val_offset = offsetof(struct SharedMem, samples_per_buffer)};
-struct kobj_attr_struct_s attr_buffer_period_ns = {
-        .attr       = __ATTR(buffer_period_ns, 0660, sysfs_SharedMem_show, NULL),
-        .val_offset = offsetof(struct SharedMem, buffer_period_ns)};
 struct kobj_attr_struct_s attr_mode = {
         .attr       = __ATTR(mode, 0660, sysfs_mode_show, sysfs_mode_store),
-        .val_offset = offsetof(struct SharedMem, shepherd_mode)};
+        .val_offset = offsetof(struct SharedMem, shp_pru0_mode)};
 struct kobj_attr_struct_s attr_auxiliary_voltage = {
         .attr       = __ATTR(dac_auxiliary_voltage_raw, 0660, sysfs_SharedMem_show,
                              sysfs_auxiliary_voltage_store),
@@ -197,9 +208,6 @@ struct kobj_attribute attr_sync_error_sum =
         __ATTR(error_sum, 0660, sysfs_sync_error_sum_show, NULL);
 
 static struct attribute *pru_attrs[] = {
-        &attr_n_buffers.attr.attr,
-        &attr_samples_per_buffer.attr.attr,
-        &attr_buffer_period_ns.attr.attr,
         &attr_mode.attr.attr,
         &attr_auxiliary_voltage.attr.attr,
         &attr_calibration_settings.attr.attr,
@@ -215,8 +223,14 @@ static struct attribute_group attr_group = {
 
 
 static struct attribute *pru_mem_attrs[] = {
-        &attr_mem_base_addr.attr.attr,
-        &attr_mem_size.attr.attr,
+        &attr_buffer_iv_inp_ptr.attr.attr,
+        &attr_buffer_iv_inp_size.attr.attr,
+        &attr_buffer_iv_out_ptr.attr.attr,
+        &attr_buffer_iv_out_size.attr.attr,
+        &attr_buffer_gpio_ptr.attr.attr,
+        &attr_buffer_gpio_size.attr.attr,
+        &attr_buffer_util_ptr.attr.attr,
+        &attr_buffer_util_size.attr.attr,
         NULL,
 };
 static struct attribute_group attr_mem_group = {
@@ -273,19 +287,19 @@ static ssize_t sysfs_SharedMem_show(struct kobject *const kobj, struct kobj_attr
 
 static ssize_t sysfs_sync_error_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
-    return sprintf(buf, "%lld", sync_data->error_now);
+    return sprintf(buf, "%u", 0u); // TODO: remove
 }
 
 static ssize_t sysfs_sync_error_sum_show(struct kobject *kobj, struct kobj_attribute *attr,
                                          char *buf)
 {
-    return sprintf(buf, "%lld", sync_data->error_sum);
+    return sprintf(buf, "%u", 0u); // TODO: remove
 }
 
 static ssize_t sysfs_sync_correction_show(struct kobject *kobj, struct kobj_attribute *attr,
                                           char *buf)
 {
-    return sprintf(buf, "%d", sync_data->clock_corr);
+    return sprintf(buf, "%u", 0u); // TODO: remove
 }
 
 static ssize_t sysfs_state_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
@@ -486,7 +500,8 @@ static ssize_t sysfs_virtual_converter_settings_store(struct kobject        *kob
 {
     const uint32_t inp_lut_size = LUT_SIZE * LUT_SIZE * 1u;
     const uint32_t out_lut_size = LUT_SIZE * 4u;
-    const uint32_t non_lut_size = sizeof(struct ConverterConfig) - inp_lut_size - out_lut_size;
+    const uint32_t non_lut_size = sizeof(struct ConverterConfig) - inp_lut_size - out_lut_size - 4u;
+    // ignore canary
     const struct kobj_attr_struct_s *kobj_attr_wrapped;
     uint32_t                         mem_offset = 0u;
     int32_t                          buf_pos    = 0;
@@ -544,7 +559,8 @@ static ssize_t sysfs_virtual_converter_settings_show(struct kobject        *kobj
 {
     const uint32_t inp_lut_size = LUT_SIZE * LUT_SIZE * 1u;
     const uint32_t out_lut_size = LUT_SIZE * 4u;
-    const uint32_t non_lut_size = sizeof(struct ConverterConfig) - inp_lut_size - out_lut_size;
+    const uint32_t non_lut_size = sizeof(struct ConverterConfig) - inp_lut_size - out_lut_size - 4u;
+    // ignore canary
     const struct kobj_attr_struct_s *const kobj_attr_wrapped =
             container_of(attr, struct kobj_attr_struct_s, attr);
     uint32_t mem_offset = 0u;
@@ -581,7 +597,8 @@ static ssize_t sysfs_virtual_harvester_settings_store(struct kobject        *kob
                                                       struct kobj_attribute *attr,
                                                       const char *buffer, size_t count)
 {
-    static const uint32_t            struct_size = sizeof(struct HarvesterConfig);
+    static const uint32_t            struct_size = sizeof(struct HarvesterConfig) - 4u;
+    // ignore canary
     const struct kobj_attr_struct_s *kobj_attr_wrapped;
     uint32_t                         mem_offset = 0u;
     int32_t                          buf_pos    = 0;
@@ -607,7 +624,8 @@ static ssize_t sysfs_virtual_harvester_settings_store(struct kobject        *kob
 static ssize_t sysfs_virtual_harvester_settings_show(struct kobject        *kobj,
                                                      struct kobj_attribute *attr, char *buf)
 {
-    static const uint32_t                  struct_size = sizeof(struct HarvesterConfig);
+    static const uint32_t                  struct_size = sizeof(struct HarvesterConfig) - 4u;
+    // ignore canary
     const struct kobj_attr_struct_s *const kobj_attr_wrapped =
             container_of(attr, struct kobj_attr_struct_s, attr);
     uint32_t mem_offset = 0u;
@@ -751,7 +769,8 @@ static ssize_t sysfs_prog_datasize_store(struct kobject *kobj, struct kobj_attri
     if (mem_interface_get_state() != STATE_IDLE) return -EBUSY;
 
     kobj_attr_wrapped = container_of(attr, struct kobj_attr_struct_s, attr);
-    value_max         = readl(pru_shared_mem_io + offsetof(struct SharedMem, mem_size));
+    value_max         = readl(pru_shared_mem_io + offsetof(struct SharedMem, buffer_iv_inp_size) +
+                              offsetof(struct SharedMem, buffer_iv_out_size));
 
     if (sscanf(buffer, "%u", &value) != 1) return -EINVAL;
     if ((value < 1) || (value > value_max)) return -EINVAL;
@@ -934,4 +953,5 @@ void sysfs_interface_exit(void)
     kobject_put(kobj_sync_ref);
     kobject_put(kobj_mem_ref);
     kobject_put(kobj_ref);
+    printk(KERN_INFO "shprd.k: sysfs exited");
 }

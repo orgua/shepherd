@@ -3,7 +3,7 @@
 
 #include "commons.h"
 
-void     calibration_initialize(const volatile struct CalibrationConfig *);
+void     calibration_initialize();
 
 uint32_t cal_conv_adc_raw_to_nA(uint32_t current_raw);
 uint32_t cal_conv_adc_raw_to_uV(uint32_t voltage_raw);

@@ -35,9 +35,9 @@ Generate the two programmers (SWD is default):
 cd shepherd/software/firmware/pru0-programmer
 make clean
 make
-# equals 'make PROTO=SWD'
+# equals 'make TYPE=SWD'
 
-make PROTO=SBW
+make TYPE=SBW
 sudo make install
 ```
 

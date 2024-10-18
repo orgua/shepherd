@@ -1,3 +1,4 @@
+import math
 import platform
 import sys
 import time
@@ -17,12 +18,11 @@ from tqdm import tqdm
 from typing_extensions import Self
 
 from . import commons
-from . import sysfs_interface
 from .eeprom import retrieve_calibration
 from .h5_writer import Writer
 from .logger import get_verbosity
 from .logger import log
-from .shared_memory import DataBuffer
+from .shared_memory import IVTrace
 from .shepherd_io import ShepherdIO
 from .shepherd_io import ShepherdPRUError
 from .target_io import TargetIO
@@ -100,11 +100,7 @@ class ShepherdEmulator(ShepherdIO):
         else:
             self.start_time = cfg.time_start.timestamp()
 
-        self.samples_per_buffer = sysfs_interface.get_samples_per_buffer()
-        self.samplerate_sps = (
-            10**9 * self.samples_per_buffer // sysfs_interface.get_buffer_period_ns()
-        )
-        self.fifo_buffer_size = sysfs_interface.get_n_buffers()
+        self.samples_per_buffer = self.reader.samples_per_buffer
         # TODO: write gpio-mask
 
         log_iv = cfg.power_tracing is not None
@@ -137,11 +133,8 @@ class ShepherdEmulator(ShepherdIO):
                 mode=mode,
                 datatype=EnergyDType.ivsample,
                 cal_data=self.cal_emu,
-                samples_per_buffer=self.samples_per_buffer,
-                samplerate_sps=self.samplerate_sps,
                 compression=cfg.output_compression,
                 verbose=get_verbosity(),
-                omit_ts=True,  # optimization during runtime
             )
 
         # hard-wire pin-direction until they are configurable
@@ -175,19 +168,21 @@ class ShepherdEmulator(ShepherdIO):
             self.writer.store_config(self.cfg.model_dump())
 
         # Preload emulator with data
-        time.sleep(1)
-        init_buffers = [
-            DataBuffer(voltage=dsv, current=dsc)
-            for _, dsv, dsc in self.reader.read_buffers(
-                end_n=self.fifo_buffer_size,
-                is_raw=True,
-                omit_ts=True,
+        self.buffer_segment_count = math.floor(commons.BUFFER_IV_SIZE // self.samples_per_buffer)
+        log.debug("Begin initial fill of IV-Buffer (n=%d segments)", self.buffer_segment_count)
+        for _, dsv, dsc in self.reader.read_buffers(
+            end_n=self.buffer_segment_count,
+            is_raw=True,
+            omit_ts=True,
+        ):
+            if not self.shared_mem.can_fit_iv_segment():
+                raise BufferError("Not enough space in buffer during initial fill.")
+            self.shared_mem.write_buffer_iv(
+                data=IVTrace(voltage=dsv, current=dsc),
+                cal=self.cal_pru,
+                verbose=False,
             )
-        ]
-        for idx, buffer in enumerate(init_buffers):
-            self.return_buffer(idx, buffer, verbose=False)
-            time.sleep(0.1 * float(self.buffer_period_ns) / 1e9)
-            # ⤷ could be as low as ~ 10us
+
         return self
 
     def __exit__(
@@ -202,36 +197,14 @@ class ShepherdEmulator(ShepherdIO):
         self.stack.close()
         super().__exit__()
 
-    def return_buffer(
-        self,
-        index: int,
-        buffer: DataBuffer,
-        *,
-        verbose: bool = False,
-    ) -> None:
-        ts_start = time.time() if verbose else 0
-
-        # transform raw ADC data to SI-Units -> the virtual-source-emulator in PRU expects uV and nV
-        v_tf = self.cal_pru.voltage.raw_to_si(buffer.voltage).astype("u4")
-        c_tf = self.cal_pru.current.raw_to_si(buffer.current).astype("u4")
-
-        self.shared_mem.clear_buffer(index)
-        self.shared_mem.write_buffer(index, v_tf, c_tf)
-        super()._return_buffer(index)
-        if verbose:
-            log.debug(
-                "Sending emu-buffer #%d to PRU took %.2f ms",
-                index,
-                1e3 * (time.time() - ts_start),
-            )
-
     def run(self) -> None:
         success = self.start(self.start_time, wait_blocking=False)
         if not success:
             return
         log.info("waiting %.2f s until start", self.start_time - time.time())
         self.wait_for_start(self.start_time - time.time() + 15)
-        log.info("shepherd started!")
+        self.handle_pru_messages()
+        log.info("shepherd started! T_sys = %f", time.time())
 
         if self.cfg.duration is not None:
             duration_s = self.cfg.duration.total_seconds()
@@ -243,7 +216,6 @@ class ShepherdEmulator(ShepherdIO):
             log.debug("Duration = %s (runtime of input file)", duration_s)
 
         # Heartbeat-Message
-        buffer_period_s = self.samples_per_buffer / self.samplerate_sps
         prog_bar = tqdm(
             total=duration_s,
             desc="Measurement",
@@ -253,46 +225,87 @@ class ShepherdEmulator(ShepherdIO):
         )
 
         # Main Loop
+        ts_data_last = self.start_time
         for _, dsv, dsc in self.reader.read_buffers(
-            start_n=self.fifo_buffer_size,
+            start_n=self.buffer_segment_count,
             is_raw=True,
             omit_ts=True,
         ):
-            idx, emu_buf = self.get_buffer(verbose=self.verbose_extra)
-            ts_now = emu_buf.timestamp_ns / 1e9
+            # TODO: transform h5_recorders into monitors, make all 3 free threading
+            while not self.shared_mem.can_fit_iv_segment():
+                data_iv = self.shared_mem.read_buffer_iv(verbose=self.verbose_extra)
+                data_gp = self.shared_mem.read_buffer_gpio(verbose=self.verbose_extra)
+                data_ut = self.shared_mem.read_buffer_util(verbose=True)
+                if data_gp and self.writer is not None:
+                    self.writer.write_gpio_buffer(data_gp)
+                if data_ut and self.writer is not None:
+                    self.writer.write_util_buffer(data_ut)
 
-            if ts_now >= ts_end:
-                log.debug("FINISHED! Out of bound timestamp collected -> begin to exit now")
-                break
-            prog_bar.update(n=buffer_period_s)
+                if data_iv:
+                    prog_bar.update(n=data_iv.duration())
+                    # TODO: this can't work - with the limited tracers
+                    if data_iv.timestamp() >= ts_end:
+                        log.debug("FINISHED! Out of bound timestamp collected -> begin to exit now")
+                        break
+                    ts_data_last = time.time()
+                    if self.writer is not None:
+                        try:
+                            self.writer.write_iv_buffer(data_iv)
+                        except OSError as _xpt:
+                            log.error(
+                                "Failed to write data to HDF5-File - will STOP! error = %s",
+                                _xpt,
+                            )
+                            return
 
-            if self.writer is not None:
-                try:
-                    self.writer.write_buffer(emu_buf)
-                except OSError as _xpt:
-                    log.error(
-                        "Failed to write data to HDF5-File - will STOP! error = %s",
-                        _xpt,
-                    )
-                    return
+                # TODO: implement cleaner exit (pru-statechange or end-timestamp
 
-            hrvst_buf = DataBuffer(voltage=dsv, current=dsc)
-            self.return_buffer(idx, hrvst_buf, verbose=self.verbose_extra)
+                self.handle_pru_messages()
+                if not (data_iv or data_gp or data_ut):
+                    if ts_data_last - time.time() > 10:
+                        log.error("Main sheep-routine ran dry for 10s, will STOP")
+                        break
+                    # rest of loop is non-blocking, so we better doze a while if nothing to do
+                    time.sleep(self.segment_period_s / 10)
+            self.shared_mem.write_buffer_iv(
+                data=IVTrace(voltage=dsv, current=dsc),
+                cal=self.cal_pru,
+                verbose=self.verbose_extra,
+            )
 
-        prog_bar.close()
         # Read all remaining buffers from PRU
         try:
             while True:
-                idx, emu_buf = self.get_buffer(verbose=self.verbose_extra)
-                if emu_buf.timestamp_ns / 1e9 >= ts_end:
-                    log.debug("FINISHED! Out of bound timestamp collected -> begin to exit now")
-                    return
-                if self.writer is not None:
-                    self.writer.write_buffer(emu_buf)
+                data_iv = self.shared_mem.read_buffer_iv(verbose=self.verbose_extra)
+                data_gp = self.shared_mem.read_buffer_gpio(verbose=self.verbose_extra)
+                data_ut = self.shared_mem.read_buffer_util(verbose=self.verbose_extra)
+                if data_gp and self.writer is not None:
+                    self.writer.write_gpio_buffer(data_gp)
+                if data_ut and self.writer is not None:
+                    self.writer.write_util_buffer(data_ut)
+
+                if data_iv:
+                    prog_bar.update(n=data_iv.duration())
+                    if data_iv.timestamp() >= ts_end:
+                        log.debug("FINISHED! Out of bound timestamp collected -> begin to exit now")
+                        return
+                    ts_data_last = time.time()
+                    if self.writer is not None:
+                        self.writer.write_iv_buffer(data_iv)
+                # TODO: implement cleaner exit (pru-statechange or end-timestamp
+                self.handle_pru_messages()
+                if not (data_iv or data_gp or data_ut):
+                    if ts_data_last - time.time() > 10:
+                        log.error("Post sheep-routine ran dry for 10s, will STOP")
+                        break
+                    # rest of loop is non-blocking, so we better doze a while if nothing to do
+                    time.sleep(self.segment_period_s / 10)
+
         except ShepherdPRUError as e:
             # We're done when the PRU has processed all emulation data buffers
-            if e.id_num == commons.MSG_ERR_NOFREEBUF:
+            if e.id_num == commons.MSG_STATUS_RESTARTING_ROUTINE:
                 log.debug("FINISHED! Collected all Buffers from PRU -> begin to exit now")
+                prog_bar.close()
                 return
             raise ShepherdPRUError from e
         except OSError as _xpt:
@@ -301,3 +314,4 @@ class ShepherdEmulator(ShepherdIO):
                 _xpt,
             )
             return
+        prog_bar.close()

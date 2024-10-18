@@ -13,11 +13,9 @@ from shepherd_core.data_models.task import EmulationTask
 from shepherd_core.data_models.testbed import TargetPort
 from shepherd_sheep import ShepherdDebug
 from shepherd_sheep import ShepherdEmulator
-from shepherd_sheep import ShepherdIOError
 from shepherd_sheep import Writer
 from shepherd_sheep import run_emulator
-from shepherd_sheep import sysfs_interface
-from shepherd_sheep.shared_memory import DataBuffer
+from shepherd_sheep.shared_memory import IVTrace
 
 
 def random_data(length: int) -> np.ndarray:
@@ -44,8 +42,10 @@ def data_h5(tmp_path: Path) -> Path:
         store.store_hostname("Inky")
         for i in range(100):
             len_ = 10_000
-            mock_data = DataBuffer(random_data(len_), random_data(len_), i)
-            store.write_buffer(mock_data)
+            mock_data = IVTrace(
+                voltage=random_data(len_), current=random_data(len_), timestamp_ns=i
+            )
+            store.write_iv_buffer(mock_data)
     return store_path
 
 
@@ -89,20 +89,22 @@ def test_emulation(
     emulator: ShepherdEmulator,
 ) -> None:
     emulator.start(wait_blocking=False)
-    fifo_buffer_size = sysfs_interface.get_n_buffers()
     emulator.wait_for_start(15)
-    for _, dsv, dsc in shp_reader.read_buffers(start_n=fifo_buffer_size, is_raw=True):
-        idx, emu_buf = emulator.get_buffer()
-        writer.write_buffer(emu_buf)
-        hrv_buf = DataBuffer(voltage=dsv, current=dsc)
-        emulator.return_buffer(idx, hrv_buf)
+    for _, dsv, dsc in shp_reader.read_buffers(start_n=emulator.buffer_segment_count, is_raw=True):
+        while not emulator.shared_mem.can_fit_iv_segment():
+            _data = emulator.shared_mem.read_buffer_iv()
+            if _data:
+                writer.write_iv_buffer(_data)
+            else:
+                time.sleep(emulator.segment_period_s / 2)
+        emulator.shared_mem.write_buffer_iv(data=IVTrace(voltage=dsv, current=dsc))
 
-    for _ in range(fifo_buffer_size):
-        idx, emu_buf = emulator.get_buffer()
-        writer.write_buffer(emu_buf)
-
-    with pytest.raises(ShepherdIOError):
-        _, _ = emulator.get_buffer()
+    for _ in range(emulator.buffer_segment_count):
+        _data = emulator.shared_mem.read_buffer_iv()
+        if _data:
+            writer.write_iv_buffer(_data)
+        else:
+            time.sleep(emulator.segment_period_s / 2)
 
 
 @pytest.mark.hardware

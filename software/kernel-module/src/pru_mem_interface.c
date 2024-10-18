@@ -2,14 +2,15 @@
 #include <linux/hrtimer.h>
 #include <linux/ktime.h>
 
-#include "commons.h"
-#include "commons_inits.h"
+#include "_commons.h"
+#include "_commons_inits.h"
+#include "_shared_mem.h"
 #include "pru_mem_interface.h"
 
-#define PRU_BASE_ADDR        0x4A300000
-#define PRU_INTC_OFFSET      0x00020000
-#define PRU_INTC_SIZE        0x400
-#define PRU_INTC_SISR_OFFSET 0x20
+#define PRU_BASE_ADDR        (0x4A300000ul)
+#define PRU_INTC_OFFSET      (0x00020000ul)
+#define PRU_INTC_SIZE        (0x400)
+#define PRU_INTC_SISR_OFFSET (0x20)
 
 static void __iomem        *pru_intc_io       = NULL;
 void __iomem               *pru_shared_mem_io = NULL;
@@ -28,10 +29,9 @@ void                        mem_interface_init(void)
         return;
     }
     /* Maps the control registers of the PRU's interrupt controller */
-    pru_intc_io = ioremap(PRU_BASE_ADDR + PRU_INTC_OFFSET, PRU_INTC_SIZE);
+    pru_intc_io       = ioremap(PRU_BASE_ADDR + PRU_INTC_OFFSET, PRU_INTC_SIZE);
     /* Maps the shared memory in the shared DDR, used to exchange info/control between PRU cores and kernel */
-    pru_shared_mem_io =
-            ioremap(PRU_BASE_ADDR + PRU_SHARED_MEM_STRUCT_OFFSET, sizeof(struct SharedMem));
+    pru_shared_mem_io = ioremap(PRU_BASE_ADDR + PRU_SHARED_MEM_OFFSET, sizeof(struct SharedMem));
 
     hrtimer_init(&delayed_start_timer, CLOCK_REALTIME, HRTIMER_MODE_ABS);
     delayed_start_timer.function = &delayed_start_callback;
@@ -61,7 +61,8 @@ void mem_interface_exit(void)
 
 void mem_interface_reset(void)
 {
-    struct SharedMem *shared_mem = (struct SharedMem *) pru_shared_mem_io;
+    struct SharedMem *const shared_mem = (struct SharedMem *) pru_shared_mem_io;
+    // TODO: why not use this as default interface?
 
     if (!init_done)
     {
@@ -76,12 +77,13 @@ void mem_interface_reset(void)
     shared_mem->programmer_ctrl      = ProgrammerCtrl_default;
 
     shared_mem->pru0_msg_inbox       = ProtoMsg_default;
-    shared_mem->pru0_msg_outbox      = ProtoMsg_default;
-    shared_mem->pru0_msg_error       = ProtoMsg_default;
+    //shared_mem->pru0_msg_outbox      = ProtoMsg_default;  // Owned by PRU
+    //shared_mem->pru0_msg_error       = ProtoMsg_default;
 
-    shared_mem->pru1_sync_inbox      = SyncMsg_default;
-    shared_mem->pru1_sync_outbox     = ProtoMsg_default;
-    shared_mem->pru1_msg_error       = ProtoMsg_default;
+    shared_mem->pru1_msg_inbox       = ProtoMsg_default;
+    //shared_mem->pru1_msg_outbox      = ProtoMsg_default; // Owned by PRU
+    //shared_mem->pru1_msg_error       = ProtoMsg_default;
+    shared_mem->canary               = CANARY_VALUE_U32;
     printk(KERN_INFO "shprd.k: mem-interface reset to default");
 }
 
@@ -109,7 +111,7 @@ int mem_interface_schedule_delayed_start(unsigned int start_time_second)
      * start. This allows the PRU enough time to receive the interrupt and
      * prepare itself to start at exactly the right time.
      */
-    kt_trigger    = ktime_sub_ns(kt_trigger, 3 * mem_interface_get_buffer_period_ns() / 4);
+    kt_trigger    = ktime_sub_ns(kt_trigger, 3 * SYNC_INTERVAL_NS / 4); // TODO: try 15/16 or larger
 
     ts_trigger_ns = ktime_to_ns(kt_trigger);
 
@@ -131,23 +133,18 @@ void mem_interface_trigger(unsigned int system_event)
 enum ShepherdState mem_interface_get_state(void)
 {
     return (enum ShepherdState) readl(pru_shared_mem_io +
-                                      offsetof(struct SharedMem, shepherd_state));
+                                      offsetof(struct SharedMem, shp_pru_state));
 }
 
 void mem_interface_set_state(enum ShepherdState state)
 {
-    writel(state, pru_shared_mem_io + offsetof(struct SharedMem, shepherd_state));
+    writel(state, pru_shared_mem_io + offsetof(struct SharedMem, shp_pru_state));
 }
 
-unsigned int mem_interface_get_buffer_period_ns(void)
-{
-    return readl(pru_shared_mem_io + offsetof(struct SharedMem, buffer_period_ns));
-}
-
-
+// TODO: unify send/receive functions a lot of duplication
 unsigned char pru1_comm_receive_sync_request(struct ProtoMsg *const msg)
 {
-    static const uint32_t offset_msg    = offsetof(struct SharedMem, pru1_sync_outbox);
+    static const uint32_t offset_msg    = offsetof(struct SharedMem, pru1_msg_outbox);
     static const uint32_t offset_unread = offset_msg + offsetof(struct ProtoMsg, unread);
 
     /* testing for unread-msg-token */
@@ -161,23 +158,25 @@ unsigned char pru1_comm_receive_sync_request(struct ProtoMsg *const msg)
         if (msg->id != MSG_TO_KERNEL) /* Error occurs if something writes over boundaries */
             printk(KERN_ERR "shprd.k: recv_sync_req from pru1 -> mem corruption? id=%u (!=%u)",
                    msg->id, MSG_TO_KERNEL);
-
+        if (msg->canary != CANARY_VALUE_U32)
+            printk(KERN_ERR "shprd.k: recv_sync_req from PRU1 -> canary was harmed");
         return 1;
     }
     return 0;
 }
 
 
-unsigned char pru1_comm_send_sync_reply(struct SyncMsg *const msg)
+unsigned char pru1_comm_send_sync_reply(struct ProtoMsg *const msg)
 {
-    static const uint32_t offset_msg    = offsetof(struct SharedMem, pru1_sync_inbox);
-    static const uint32_t offset_unread = offset_msg + offsetof(struct SyncMsg, unread);
+    static const uint32_t offset_msg    = offsetof(struct SharedMem, pru1_msg_inbox);
+    static const uint32_t offset_unread = offset_msg + offsetof(struct ProtoMsg, unread);
     const unsigned char   status        = readb(pru_shared_mem_io + offset_unread) == 0u;
 
     /* first update payload in memory */
     msg->id                             = MSG_TO_PRU;
     msg->unread                         = 0u;
-    memcpy_toio(pru_shared_mem_io + offset_msg, msg, sizeof(struct SyncMsg));
+    msg->canary                         = CANARY_VALUE_U32;
+    memcpy_toio(pru_shared_mem_io + offset_msg, msg, sizeof(struct ProtoMsg));
 
     /* activate message with unread-token */
     writeb(1u, pru_shared_mem_io + offset_unread);
@@ -201,7 +200,8 @@ unsigned char pru0_comm_receive_error(struct ProtoMsg *const msg)
         if (msg->id != MSG_TO_KERNEL) /* Error occurs if something writes over boundaries */
             printk(KERN_ERR "shprd.k: recv_status from pru0 -> mem corruption? id=%u (!=%u)",
                    msg->id, MSG_TO_KERNEL);
-
+        if (msg->canary != CANARY_VALUE_U32)
+            printk(KERN_ERR "shprd.k: recv_error from PRU0 -> canary was harmed");
         return 1;
     }
     return 0;
@@ -224,7 +224,8 @@ unsigned char pru1_comm_receive_error(struct ProtoMsg *const msg)
         if (msg->id != MSG_TO_KERNEL) /* Error occurs if something writes over boundaries */
             printk(KERN_ERR "shprd.k: recv_status from pru1 -> mem corruption? id=%u (!=%u)",
                    msg->id, MSG_TO_KERNEL);
-
+        if (msg->canary != CANARY_VALUE_U32)
+            printk(KERN_ERR "shprd.k: recv_error from PRU1 -> canary was harmed");
         return 1;
     }
     return 0;
@@ -247,7 +248,8 @@ unsigned char pru0_comm_receive_msg(struct ProtoMsg *const msg)
         if (msg->id != MSG_TO_KERNEL) /* Error occurs if something writes over boundaries */
             printk(KERN_ERR "shprd.k: recv_msg from pru0 -> mem corruption? id=%u (!=%u)", msg->id,
                    MSG_TO_KERNEL);
-
+        if (msg->canary != CANARY_VALUE_U32)
+            printk(KERN_ERR "shprd.k: recv_msg from PRU1 -> canary was harmed");
         return 1;
     }
     return 0;
@@ -263,6 +265,7 @@ unsigned char pru0_comm_send_msg(struct ProtoMsg *const msg)
     /* first update payload in memory */
     msg->id                             = MSG_TO_PRU;
     msg->unread                         = 0u;
+    msg->canary                         = CANARY_VALUE_U32;
     memcpy_toio(pru_shared_mem_io + offset_msg, msg, sizeof(struct ProtoMsg));
 
     /* activate message with unread-token */

@@ -28,7 +28,7 @@ from shepherd_core.data_models.task import ProgrammingTask
 from shepherd_core.data_models.testbed import ProgrammerProtocol
 from shepherd_sheep import Writer
 from shepherd_sheep.cli import cli
-from shepherd_sheep.shared_memory import DataBuffer
+from shepherd_sheep.shared_memory import IVTrace
 
 
 def random_data(length: int) -> np.ndarray:
@@ -47,8 +47,8 @@ def data_h5(tmp_path: Path) -> Path:
         store.store_hostname("Blinky")
         for i in range(100):
             len_ = 10_000
-            mock_data = DataBuffer(random_data(len_), random_data(len_), i)
-            store.write_buffer(mock_data)
+            mock_data = IVTrace(random_data(len_), random_data(len_), i)
+            store.write_iv_buffer(mock_data)
     return store_path
 
 

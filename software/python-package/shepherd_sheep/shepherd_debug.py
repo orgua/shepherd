@@ -1,6 +1,5 @@
 import contextlib
 import time
-from typing import NoReturn
 
 import msgpack
 import msgpack_numpy
@@ -135,13 +134,6 @@ class ShepherdDebug(ShepherdIO):
         value = int(value) & ((1 << 16) - 1)
         message = channels | value
         super()._send_msg(commons.MSG_DBG_DAC, message)
-
-    def get_buffer(
-        self,
-        timeout_n: float | None = None,
-        verbose: bool = False,
-    ) -> NoReturn:
-        raise NotImplementedError("Method not implemented for debugging mode")
 
     def dbg_fn_test(self, factor: int, mode: int) -> int:
         super()._send_msg(commons.MSG_DBG_FN_TESTS, [factor, mode])
@@ -415,20 +407,20 @@ class ShepherdDebug(ShepherdIO):
         length_n_buffers = int(min(max(length_n_buffers, 1), 55))
         super().reinitialize_prus()
         time.sleep(0.1)
-        for _i in range(length_n_buffers + 4):  # Fill FIFO
-            time.sleep(0.02)
-            super()._return_buffer(_i)
-        time.sleep(0.1)
         super().start(wait_blocking=True)
         c_array = np.empty([0], dtype="=u4")
         v_array = np.empty([0], dtype="=u4")
-        time.sleep(0.1)
+        time.sleep(0.2)
         for _ in range(2):  # flush first 2 buffers out
-            super().get_buffer()
+            super().shared_mem.read_buffer_iv()
+            time.sleep(self.segment_period_s)
         for _ in range(length_n_buffers):  # get Data
-            _, _buf = super().get_buffer()
-            c_array = np.hstack((c_array, _buf.current))
-            v_array = np.hstack((v_array, _buf.voltage))
+            _data_iv = None
+            while _data_iv is None:
+                _data_iv = super().shared_mem.read_buffer_iv()
+                time.sleep(self.segment_period_s / 2)
+            c_array = np.hstack((c_array, _data_iv.current))
+            v_array = np.hstack((v_array, _data_iv.voltage))
         super().reinitialize_prus()
         base_array = np.vstack((c_array, v_array))
         return msgpack.packb(

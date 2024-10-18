@@ -70,7 +70,9 @@ def cli(
     _stat: dict[str, list] = {
         "diff": [],
         "rising": [],
+        "falling": [],
         "low": [],
+        "high": [],
     }
 
     for trace in ltraces.traces:
@@ -79,15 +81,26 @@ def cli(
 
         for _ch in range(trace.channel_count):
             _data_r = trace.calc_durations_ns(_ch, edge_a_rising=True, edge_b_rising=True)
-            _expt = trace.calc_expected_value(_data_r, mode_log10=True)
-            _name = trace.name + f"_ch{_ch}_rising_{round(_expt / 1e6)}ms"
-            _data_r[:, 1] = _data_r[:, 1] - _expt
+            _expt_r = trace.calc_expected_value(_data_r, mode_log10=True)  # in nsec
+            _name = trace.name + f"_ch{_ch}_rising_{round(_expt_r / 1e3)}us"
+            _data_r[:, 1] = _data_r[:, 1] - _expt_r
             trace.plot_series_jitter(_data_r, _name, dir_path)
             _stat["rising"].append(trace.get_statistics(_data_r, _name))
+
+            _data_f = trace.calc_durations_ns(_ch, edge_a_rising=False, edge_b_rising=False)
+            _expt_f = trace.calc_expected_value(_data_f, mode_log10=True)
+            _name = trace.name + f"_ch{_ch}_falling_{round(_expt_f / 1e3)}us"
+            _data_f[:, 1] = _data_f[:, 1] - _expt_f
+            trace.plot_series_jitter(_data_f, _name, dir_path)
+            _stat["falling"].append(trace.get_statistics(_data_f, _name))
 
             _data_l = trace.calc_durations_ns(_ch, edge_a_rising=False, edge_b_rising=True)
             _name = trace.name + f"_ch{_ch}_low"
             _stat["low"].append(trace.get_statistics(_data_l, _name))
+
+            _data_h = trace.calc_durations_ns(_ch, edge_a_rising=True, edge_b_rising=False)
+            _name = trace.name + f"_ch{_ch}_high"
+            _stat["high"].append(trace.get_statistics(_data_h, _name))
 
         # sync between channels
         for _ch1 in range(trace.channel_count):

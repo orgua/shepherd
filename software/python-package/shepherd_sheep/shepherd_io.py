@@ -12,6 +12,7 @@ from types import TracebackType
 from pydantic import validate_call
 from shepherd_core import CalibrationEmulator
 from shepherd_core import CalibrationHarvester
+from shepherd_core import Reader
 from shepherd_core.data_models import GpioTracing
 from shepherd_core.data_models import PowerTracing
 from shepherd_core.data_models.content.virtual_harvester import HarvesterPRUConfig
@@ -24,7 +25,6 @@ from typing_extensions import Unpack
 from . import commons
 from . import sysfs_interface as sfs
 from .logger import log
-from .shared_memory import DataBuffer
 from .shared_memory import SharedMemory
 from .sysfs_interface import check_sys_access
 
@@ -126,18 +126,13 @@ class ShepherdIO:
             self.component = "emulator"
         self.gpios = {}
 
-        self._buffer_period: float = 0.1  # placeholder value
-
         self.trace_iv = trace_iv
         self.trace_gpio = trace_gpio
 
         # placeholders
-        self.mem_address = 0
-        self.mem_size = 0
-        self.samples_per_buffer = 0
-        self.buffer_period_ns = 0
-        self.n_buffers = 0
-        self.shared_mem: SharedMemory
+        self.samples_per_segment = Reader.samples_per_buffer
+        self.segment_period_s: float = self.samples_per_segment * commons.SAMPLE_INTERVAL_S
+        self.shared_mem: SharedMemory | None = None
 
     def __del__(self) -> None:
         ShepherdIO._instance = None
@@ -201,12 +196,13 @@ class ShepherdIO:
             timeout_n (int): Maximum number of buffer_periods to wait for a message
                 before raising timeout exception
 
-        """  # TODO: cleanest way without exception: ask sysfs-file with current msg-count
+        """
+        # TODO: cleanest way without exception: ask sysfs-file with current msg-count
         for _ in range(timeout_n):
             try:
                 return sfs.read_pru_msg()
             except sfs.SysfsInterfaceError:  # noqa: PERF203
-                time.sleep(self._buffer_period)
+                time.sleep(self.segment_period_s)
                 continue
         raise ShepherdTimeoutError
 
@@ -256,36 +252,13 @@ class ShepherdIO:
         if hasattr(self, "shared_mem") and isinstance(self.shared_mem, SharedMemory):
             self.shared_mem.__exit__()
 
-        # Ask PRU for base address of shared mem (reserved with remoteproc)
-        self.mem_address = sfs.get_mem_address()
-        # Ask PRU for size of shared memory (reserved with remoteproc)
-        self.mem_size = sfs.get_mem_size()
-
-        log.debug(
-            "Shared memory address: \t%s, size: %d byte",
-            f"0x{self.mem_address:08X}",
-            # ⤷ not directly in message because of colorizer
-            self.mem_size,
-        )
-
-        # Ask PRU for size of individual buffers
-        self.samples_per_buffer = sfs.get_samples_per_buffer()
-        log.debug("Samples per buffer: \t%d", self.samples_per_buffer)
-
-        self.n_buffers = sfs.get_n_buffers()
-        log.debug("Number of buffers: \t%d", self.n_buffers)
-
-        self.buffer_period_ns = sfs.get_buffer_period_ns()
-        self._buffer_period = self.buffer_period_ns / 1e9
-        log.debug("Buffer period: \t\t%.3f s", self._buffer_period)
+        start_time = self.start_time if hasattr(self, "start_time") else time.time()
 
         self.shared_mem = SharedMemory(
-            self.mem_address,
-            self.mem_size,
-            self.n_buffers,
-            self.samples_per_buffer,
             self.trace_iv,
             self.trace_gpio,
+            start_timestamp_ns=int(1e9 * start_time),
+            iv_segment_size=self.samples_per_segment,
         )
         self.shared_mem.__enter__()
 
@@ -516,68 +489,32 @@ class ShepherdIO:
         """
         sfs.write_virtual_harvester_settings(settings)
 
-    def _return_buffer(self, index: int) -> None:
-        """Returns a buffer to the PRU
+    @staticmethod
+    def handle_pru_messages() -> None:
+        """checks message inbox coming from both PRUs.
 
-        After reading the content of a buffer and potentially filling it with
-        emulation data, we have to release the buffer to the PRU to avoid it
-        running out of buffers.
-
-        Args:
-            index (int): Index of the buffer. 0 <= index < n_buffers
-        """
-        self._send_msg(commons.MSG_BUF_FROM_HOST, index)
-
-    def get_buffer(
-        self,
-        timeout_n: int = 60,
-        *,
-        verbose: bool = False,
-    ) -> tuple[int, DataBuffer]:
-        """Reads a data buffer from shared memory.
-
-        Polls the msg-channel for a message from PRU0 and, if the message
-        points to a filled buffer in memory, returns the data in the
-        corresponding memory location as DataBuffer.
-
-        Args:
-            :param timeout_n: (int) Time in buffer_periods that should be waited for
-            :param verbose: (bool) more debug output
-        Returns:
-            Index and content of corresponding data buffer
         Raises:
-            TimeoutException: If no message is received within
-                specified timeout
+            ShepherdPRUError: If unrecoverable error was detected
         """
         while True:
-            msg_type, values = self._get_msg(timeout_n)
-            value = values[0]
-
-            if msg_type == commons.MSG_BUF_FROM_PRU:
-                ts_start = time.time()
-                buf = self.shared_mem.read_buffer(value, verbose=verbose)
-                if verbose:
-                    log.debug(
-                        "Processing buffer #%d from shared memory took %.2f ms",
-                        value,
-                        1e3 * (time.time() - ts_start),
-                    )
-                return value, buf
+            try:
+                msg_type, values = sfs.read_pru_msg()
+            except sfs.SysfsInterfaceError:
+                return
 
             if msg_type == commons.MSG_DBG_PRINT:
-                log.info("Received cmd to print: %d", value)
+                log.info("Received cmd to print: %d, %d", values[0], values[1])
                 continue
 
             if msg_type == commons.MSG_STATUS_RESTARTING_ROUTINE:
-                log.debug("PRU is restarting its main routine, val=%d", value)
+                log.debug(
+                    "PRU%d is restarting its main routine, val2=%s",
+                    values[0],
+                    f"0x{values[0]:X}",
+                )
+                # TODO: this should raise when needed (during normal OP)
                 continue
 
             error_msg: str | None = commons.pru_errors.get(msg_type)
             if error_msg is not None:
-                raise ShepherdPRUError(error_msg, msg_type, value)
-
-            raise ShepherdRxError(
-                commons.MSG_BUF_FROM_PRU,
-                msg_type,
-                value,
-            )
+                raise ShepherdPRUError(error_msg, msg_type, values)

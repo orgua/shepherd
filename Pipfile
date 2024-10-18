@@ -13,6 +13,7 @@ shepherd-data = "*"
 sync-analysis = {editable = true, path = "./software/debug_analyze_time_sync"}
 # temporary
 dearpygui = "*"
+pre-commit = "*"
 
 [dev-packages]
 bump2version = "*"

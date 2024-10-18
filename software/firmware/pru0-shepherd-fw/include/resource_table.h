@@ -11,7 +11,7 @@ struct my_resource_table
     uint32_t               offset[1]; /* Should match 'num' in actual definition */
 
     /* mem-resource definition */
-    struct fw_rsc_carveout shared_mem;
+    struct fw_rsc_carveout shared_memory;
 };
 
 #endif /* SHEPHERD_PRU0_RESOURCE_TABLE_H_ */

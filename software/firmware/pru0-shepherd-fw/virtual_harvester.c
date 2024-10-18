@@ -3,10 +3,12 @@
 #include "hw_config.h"
 #include "math64_safe.h"
 #include "spi_transfer_pru.h"
+#include <stddef.h>
 #include <stdint.h>
 
 #include "fw_config.h"
 #include "msg_sys.h"
+#include "shared_mem.h"
 
 // internal variables
 uint32_t        voltage_set_uV = 0u; // global
@@ -26,14 +28,17 @@ static uint32_t voc_min            = 0u;
 static bool_ft  lin_extrapolation  = 0u;
 #endif // EMU_SUPPORT
 
-static uint32_t                               settle_steps   = 0; // adc_ivcurve
-static uint32_t                               interval_step  = 0u;
+static uint32_t settle_steps   = 0; // adc_ivcurve
+static uint32_t interval_step  = 0u;
 
-static uint32_t                               volt_step_uV   = 0u;
-static uint32_t                               power_last_raw = 0u; // adc_mppt_po
+static uint32_t volt_step_uV   = 0u;
+static uint32_t power_last_raw = 0u; // adc_mppt_po
 
 
-static const volatile struct HarvesterConfig *cfg;
+#define HRV_CFG                                                                                    \
+    (*((volatile struct HarvesterConfig *) (PRU_SHARED_MEM_OFFSET +                                \
+                                            offsetof(struct SharedMem, harvester_settings))))
+static volatile struct IVTraceOut *buffer;
 
 #ifdef HRV_SUPPORT
 /* ivcurve cutout
@@ -44,11 +49,11 @@ static const volatile struct HarvesterConfig *cfg;
 static const uint32_t STEP_IV_CUTOUT = 5u;
 
 // to be used with harvester-frontend
-static void harvest_adc_2_ivcurve(struct SampleBuffer *const buffer, const uint32_t sample_idx);
-static void harvest_adc_2_isc_voc(struct SampleBuffer *const buffer, const uint32_t sample_idx);
-static void harvest_adc_2_cv(struct SampleBuffer *const buffer, const uint32_t sample_idx);
-static void harvest_adc_2_mppt_voc(struct SampleBuffer *const buffer, const uint32_t sample_idx);
-static void harvest_adc_2_mppt_po(struct SampleBuffer *const buffer, const uint32_t sample_idx);
+static void           harvest_adc_2_ivcurve(const uint32_t sample_idx);
+static void           harvest_adc_2_isc_voc(const uint32_t sample_idx);
+static void           harvest_adc_2_cv(const uint32_t sample_idx);
+static void           harvest_adc_2_mppt_voc(const uint32_t sample_idx);
+static void           harvest_adc_2_mppt_po(const uint32_t sample_idx);
 #endif // HRV_SUPPORT
 
 #ifdef EMU_SUPPORT
@@ -75,22 +80,23 @@ void            dac_write(uint32_t cs_pin, uint32_t val) { hw_value = cs_pin + v
 #define HRV_MPPT_OPT (1u << 14u)
 
 
-void harvester_initialize(const volatile struct HarvesterConfig *const config)
+void harvester_initialize()
 {
     // basic (shared) states for ADC- and IVCurve-Version
-    cfg                  = config;
-    voltage_set_uV       = cfg->voltage_uV + 1u; // deliberately off for cv-version
+    buffer               = SHARED_MEM.buffer_iv_out_ptr;
+    // TODO: replace with buffer_samples = SHARED_MEM.buffer_iv_ptr->samples
+    voltage_set_uV       = HRV_CFG.voltage_uV + 1u; // deliberately off for cv-version
     settle_steps         = 0u;
 
-    const bool_ft is_emu = (cfg->hrv_mode >> 0u) & 1u;
-    if (is_emu && (cfg->interval_n > 2 * cfg->window_size))
-        interval_step = cfg->interval_n - (2 * cfg->window_size);
+    const bool_ft is_emu = (HRV_CFG.hrv_mode >> 0u) & 1u;
+    if (is_emu && (HRV_CFG.interval_n > 2 * HRV_CFG.window_size))
+        interval_step = HRV_CFG.interval_n - (2 * HRV_CFG.window_size);
     else interval_step = 1u << 30u;
     // ⤷ intake two ivcurves before overflow / reset if possible
-    is_rising      = (cfg->hrv_mode >> 1u) & 1u;
+    is_rising      = (HRV_CFG.hrv_mode >> 1u) & 1u;
 
     // MPPT-PO
-    volt_step_uV   = cfg->voltage_step_uV;
+    volt_step_uV   = HRV_CFG.voltage_step_uV;
     power_last_raw = 0u;
 
     // for IV-Curve-Version, mostly resets states
@@ -98,36 +104,37 @@ void harvester_initialize(const volatile struct HarvesterConfig *const config)
     current_hold   = 0u;
 
 #ifdef EMU_SUPPORT
-    voltage_step_x4_uV = 4u * cfg->voltage_step_uV;
-    age_max            = 2u * cfg->window_size;
+    voltage_step_x4_uV = 4u * HRV_CFG.voltage_step_uV;
+    age_max            = 2u * HRV_CFG.window_size;
 
-    voc_now            = cfg->voltage_max_uV;
-    voc_nxt            = cfg->voltage_max_uV;
-    voc_min            = cfg->voltage_min_uV > 1000u ? cfg->voltage_min_uV : 1000u;
+    voc_now            = HRV_CFG.voltage_max_uV;
+    voc_nxt            = HRV_CFG.voltage_max_uV;
+    voc_min            = HRV_CFG.voltage_min_uV > 1000u ? HRV_CFG.voltage_min_uV : 1000u;
 
     /* extrapolation */
-    lin_extrapolation  = (cfg->hrv_mode >> 2u) & 1u;
+    lin_extrapolation  = (HRV_CFG.hrv_mode >> 2u) & 1u;
 #endif // EMU_SUPPORT
 
     // TODO: all static vars in sub-fns should be globals (they are anyway), saves space due to overlaps
     // TODO: check that ConfigParams are used in SubFns if applicable
     // TODO: divide lib into IVC and ADC Parts
 
-    // TODO: embed cfg->current_limit_nA as a limiter if resources allow for it
+    // TODO: embed HRV_CFG.current_limit_nA as a limiter if resources allow for it
 }
 
 #ifdef HRV_SUPPORT
-void sample_adc_harvester(struct SampleBuffer *const buffer, const uint32_t sample_idx)
+void sample_adc_harvester(const uint32_t sample_idx)
 {
-    if (cfg->algorithm >= HRV_MPPT_PO) harvest_adc_2_mppt_po(buffer, sample_idx);
-    else if (cfg->algorithm >= HRV_MPPT_VOC) harvest_adc_2_mppt_voc(buffer, sample_idx);
-    else if (cfg->algorithm >= HRV_CV) harvest_adc_2_cv(buffer, sample_idx);
-    else if (cfg->algorithm >= HRV_IVCURVE) harvest_adc_2_ivcurve(buffer, sample_idx);
-    else if (cfg->algorithm >= HRV_ISC_VOC) harvest_adc_2_isc_voc(buffer, sample_idx);
-    else msg_send_status(MSG_ERR_HRV_ALGO, cfg->algorithm);
+    if (HRV_CFG.algorithm >= HRV_MPPT_PO) harvest_adc_2_mppt_po(sample_idx);
+    else if (HRV_CFG.algorithm >= HRV_MPPT_VOC)
+        harvest_adc_2_mppt_voc(sample_idx); // ~ 1300 ns without SPI
+    else if (HRV_CFG.algorithm >= HRV_CV) harvest_adc_2_cv(sample_idx);
+    else if (HRV_CFG.algorithm >= HRV_IVCURVE) harvest_adc_2_ivcurve(sample_idx);
+    else if (HRV_CFG.algorithm >= HRV_ISC_VOC) harvest_adc_2_isc_voc(sample_idx);
+    else msgsys_send_status(MSG_ERR_HRV_ALGO, HRV_CFG.algorithm, 0u);
 }
 
-static void harvest_adc_2_cv(struct SampleBuffer *const buffer, const uint32_t sample_idx)
+static void harvest_adc_2_cv(const uint32_t sample_idx)
 {
     /* 	Set constant voltage and log resulting current
  * 	- ADC and DAC voltage should match but can vary, depending on calibration and load (no closed loop)
@@ -141,18 +148,18 @@ static void harvest_adc_2_cv(struct SampleBuffer *const buffer, const uint32_t s
     const uint32_t current_adc = adc_fastread(SPI_CS_HRV_C_ADC_PIN);
     const uint32_t voltage_adc = adc_fastread(SPI_CS_HRV_V_ADC_PIN);
 
-    if (voltage_set_uV != cfg->voltage_uV)
+    if (voltage_set_uV != HRV_CFG.voltage_uV)
     {
         /* set new voltage if not already set */
-        voltage_set_uV             = cfg->voltage_uV;
+        voltage_set_uV             = HRV_CFG.voltage_uV;
         const uint32_t voltage_raw = cal_conv_uV_to_dac_raw(voltage_set_uV);
         dac_write(SPI_CS_HRV_DAC_PIN, DAC_CH_B_ADDR | voltage_raw);
     }
-    buffer->values_current[sample_idx] = current_adc;
-    buffer->values_voltage[sample_idx] = voltage_adc;
+    buffer->current[sample_idx] = current_adc;
+    buffer->voltage[sample_idx] = voltage_adc;
 }
 
-static void harvest_adc_2_ivcurve(struct SampleBuffer *const buffer, const uint32_t sample_idx)
+static void harvest_adc_2_ivcurve(const uint32_t sample_idx)
 {
     /* 	Record iv-curves
  * 	- by controlling voltage with sawtooth
@@ -179,36 +186,36 @@ static void harvest_adc_2_ivcurve(struct SampleBuffer *const buffer, const uint3
 
     if (settle_steps == 0u)
     {
-        if (++interval_step >= cfg->window_size)
+        if (++interval_step >= HRV_CFG.window_size)
         {
             /* reset curve to start */
-            voltage_set_uV = is_rising ? cfg->voltage_min_uV : cfg->voltage_max_uV;
+            voltage_set_uV = is_rising ? HRV_CFG.voltage_min_uV : HRV_CFG.voltage_max_uV;
             interval_step  = 0u;
         }
         else
         {
             /* stepping through */
-            if (is_rising) voltage_set_uV = add32(voltage_set_uV, cfg->voltage_step_uV);
-            else voltage_set_uV = sub32(voltage_set_uV, cfg->voltage_step_uV);
+            if (is_rising) voltage_set_uV = add32(voltage_set_uV, HRV_CFG.voltage_step_uV);
+            else voltage_set_uV = sub32(voltage_set_uV, HRV_CFG.voltage_step_uV);
         }
         /* check boundaries */
-        if (is_rising && (voltage_set_uV > cfg->voltage_max_uV))
-            voltage_set_uV = cfg->voltage_max_uV;
-        if ((!is_rising) && (voltage_set_uV < cfg->voltage_min_uV))
-            voltage_set_uV = cfg->voltage_min_uV;
+        if (is_rising && (voltage_set_uV > HRV_CFG.voltage_max_uV))
+            voltage_set_uV = HRV_CFG.voltage_max_uV;
+        if ((!is_rising) && (voltage_set_uV < HRV_CFG.voltage_min_uV))
+            voltage_set_uV = HRV_CFG.voltage_min_uV;
 
         /* write new step */
         const uint32_t voltage_raw = cal_conv_uV_to_dac_raw(voltage_set_uV);
         dac_write(SPI_CS_HRV_DAC_PIN, DAC_CH_B_ADDR | voltage_raw);
-        settle_steps = cfg->wait_cycles_n;
+        settle_steps = HRV_CFG.wait_cycles_n;
     }
     else settle_steps--;
 
-    buffer->values_current[sample_idx] = current_adc;
-    buffer->values_voltage[sample_idx] = voltage_adc;
+    buffer->current[sample_idx] = current_adc;
+    buffer->voltage[sample_idx] = voltage_adc;
 }
 
-static void harvest_adc_2_isc_voc(struct SampleBuffer *const buffer, const uint32_t sample_idx)
+static void harvest_adc_2_isc_voc(const uint32_t sample_idx)
 {
     /* 	Record VOC & ISC
 	 * 	- open the circuit -> voltage will settle when set to MAX
@@ -234,15 +241,15 @@ static void harvest_adc_2_isc_voc(struct SampleBuffer *const buffer, const uint3
 
         /* prepare next state-change */
         is_rising ^= 1u; // reverse direction
-        settle_steps = cfg->wait_cycles_n;
+        settle_steps = HRV_CFG.wait_cycles_n;
     }
     else settle_steps--;
 
-    buffer->values_current[sample_idx] = current_hold;
-    buffer->values_voltage[sample_idx] = voltage_hold;
+    buffer->voltage[sample_idx] = voltage_hold;
+    buffer->current[sample_idx] = current_hold;
 }
 
-static void harvest_adc_2_mppt_voc(struct SampleBuffer *const buffer, const uint32_t sample_idx)
+static void harvest_adc_2_mppt_voc(const uint32_t sample_idx)
 {
     /*	Determine VOC and harvest
  * 	- first part of interval is used for determining the open circuit voltage
@@ -256,7 +263,7 @@ static void harvest_adc_2_mppt_voc(struct SampleBuffer *const buffer, const uint
     const uint32_t voltage_adc = adc_fastread(SPI_CS_HRV_V_ADC_PIN);
 
     /* keep track of time, do  step = mod(step + 1, n) */
-    if (++interval_step >= cfg->interval_n) interval_step = 0u;
+    if (++interval_step >= HRV_CFG.interval_n) interval_step = 0u;
 
     if (interval_step == 0u)
     {
@@ -264,37 +271,38 @@ static void harvest_adc_2_mppt_voc(struct SampleBuffer *const buffer, const uint
         dac_write(SPI_CS_HRV_DAC_PIN, DAC_CH_B_ADDR | DAC_MAX_VAL);
     }
 
-    if (interval_step == cfg->duration_n - 1u)
+    if (interval_step == HRV_CFG.duration_n - 1u)
     {
         /* end of voc-measurement -> lock-in the value */
         const uint32_t voc_uV = cal_conv_adc_raw_to_uV(voltage_adc);
-        voltage_set_uV        = mul32(voc_uV, cfg->setpoint_n8) >> 8u;
+        voltage_set_uV        = mul32(voc_uV, HRV_CFG.setpoint_n8) >> 8u;
 
         /* check boundaries */
-        if (voltage_set_uV > cfg->voltage_max_uV) voltage_set_uV = cfg->voltage_max_uV;
-        if (voltage_set_uV < cfg->voltage_min_uV) voltage_set_uV = cfg->voltage_min_uV;
+        if (voltage_set_uV > HRV_CFG.voltage_max_uV) voltage_set_uV = HRV_CFG.voltage_max_uV;
+        if (voltage_set_uV < HRV_CFG.voltage_min_uV) voltage_set_uV = HRV_CFG.voltage_min_uV;
 
         /* write setpoint voltage */
         const uint32_t voltage_raw = cal_conv_uV_to_dac_raw(voltage_set_uV);
         dac_write(SPI_CS_HRV_DAC_PIN, DAC_CH_B_ADDR | voltage_raw);
     }
 
-    if (interval_step < cfg->duration_n)
+    if (interval_step < HRV_CFG.duration_n)
     {
         /* output disconnected during voc-measurement */
-        buffer->values_current[sample_idx] = 0u;
-        buffer->values_voltage[sample_idx] = voltage_adc; // keep voltage for debug-purposes
+
+        buffer->current[sample_idx] = 0u;
+        buffer->voltage[sample_idx] = voltage_adc; // keep voltage for debug-purposes
     }
     else
     {
         /* converter-mode at pre-set VOC */
-        buffer->values_current[sample_idx] = current_adc;
-        buffer->values_voltage[sample_idx] = voltage_adc;
+        buffer->current[sample_idx] = current_adc;
+        buffer->voltage[sample_idx] = voltage_adc;
     }
 }
 
 
-static void harvest_adc_2_mppt_po(struct SampleBuffer *const buffer, const uint32_t sample_idx)
+static void harvest_adc_2_mppt_po(const uint32_t sample_idx)
 {
     /*	perturb & observe
 	 * 	- move a voltage step every interval and evaluate power-increase
@@ -310,7 +318,7 @@ static void harvest_adc_2_mppt_po(struct SampleBuffer *const buffer, const uint3
     const uint32_t voltage_adc = adc_fastread(SPI_CS_HRV_V_ADC_PIN);
 
     /* keep track of time, do  step = mod(step + 1, n) */
-    if (++interval_step >= cfg->interval_n) interval_step = 0u;
+    if (++interval_step >= HRV_CFG.interval_n) interval_step = 0u;
 
     if (interval_step == 0u)
     {
@@ -327,7 +335,7 @@ static void harvest_adc_2_mppt_po(struct SampleBuffer *const buffer, const uint3
         {
             /* got less power -> reverse direction, restart step-size */
             is_rising ^= 1u;
-            volt_step_uV = cfg->voltage_step_uV;
+            volt_step_uV = HRV_CFG.voltage_step_uV;
             if (is_rising) voltage_set_uV = add32(voltage_set_uV, volt_step_uV);
             else voltage_set_uV = sub32(voltage_set_uV, volt_step_uV);
         }
@@ -343,43 +351,46 @@ static void harvest_adc_2_mppt_po(struct SampleBuffer *const buffer, const uint3
         }
 
         /* check boundaries */
-        if (voltage_set_uV >= cfg->voltage_max_uV)
+        if (voltage_set_uV >= HRV_CFG.voltage_max_uV)
         {
-            voltage_set_uV = cfg->voltage_max_uV;
+            voltage_set_uV = HRV_CFG.voltage_max_uV;
             is_rising      = 0u;
-            volt_step_uV   = cfg->voltage_step_uV;
+            volt_step_uV   = HRV_CFG.voltage_step_uV;
         }
-        if (voltage_set_uV <= cfg->voltage_min_uV)
+        if (voltage_set_uV <= HRV_CFG.voltage_min_uV)
         {
-            voltage_set_uV = cfg->voltage_min_uV;
+            voltage_set_uV = HRV_CFG.voltage_min_uV;
             is_rising      = 1u;
-            volt_step_uV   = cfg->voltage_step_uV;
+            volt_step_uV   = HRV_CFG.voltage_step_uV;
         }
 
         /* write setpoint voltage */
         const uint32_t voltage_raw = cal_conv_uV_to_dac_raw(voltage_set_uV);
         dac_write(SPI_CS_HRV_DAC_PIN, DAC_CH_B_ADDR | voltage_raw);
     }
-    buffer->values_current[sample_idx] = current_adc;
-    buffer->values_voltage[sample_idx] = voltage_adc;
+    buffer->current[sample_idx] = current_adc;
+    buffer->voltage[sample_idx] = voltage_adc;
 }
 #endif // HRV_SUPPORT
 
 /* // TODO: do we need a constant-current-version?
 const uint32_t current_nA = cal_conv_adc_raw_to_nA(current_adc); // TODO: could be simplified by providing raw-value in cfg
-if (current_nA > cfg->current_limit_nA)
+if (current_nA > HRV_CFG.current_limit_nA)
 */
 
 #ifdef EMU_SUPPORT
 void sample_ivcurve_harvester(uint32_t *const p_voltage_uV, uint32_t *const p_current_nA)
 {
     // check for IVCurve-Input Indicator and use selected algo
-    if (cfg->window_size <= 1) return;
-    else if (cfg->algorithm >= HRV_MPPT_OPT) harvest_ivcurve_2_mppt_opt(p_voltage_uV, p_current_nA);
-    else if (cfg->algorithm >= HRV_MPPT_PO) harvest_ivcurve_2_mppt_po(p_voltage_uV, p_current_nA);
-    else if (cfg->algorithm >= HRV_MPPT_VOC) harvest_ivcurve_2_mppt_voc(p_voltage_uV, p_current_nA);
-    else if (cfg->algorithm >= HRV_CV) harvest_ivcurve_2_cv(p_voltage_uV, p_current_nA);
-    else msg_send_status(MSG_ERR_HRV_ALGO, cfg->algorithm);
+    if (HRV_CFG.window_size <= 1) return;
+    else if (HRV_CFG.algorithm >= HRV_MPPT_OPT)
+        harvest_ivcurve_2_mppt_opt(p_voltage_uV, p_current_nA);
+    else if (HRV_CFG.algorithm >= HRV_MPPT_PO)
+        harvest_ivcurve_2_mppt_po(p_voltage_uV, p_current_nA);
+    else if (HRV_CFG.algorithm >= HRV_MPPT_VOC)
+        harvest_ivcurve_2_mppt_voc(p_voltage_uV, p_current_nA);
+    else if (HRV_CFG.algorithm >= HRV_CV) harvest_ivcurve_2_cv(p_voltage_uV, p_current_nA);
+    else msgsys_send_status(MSG_ERR_HRV_ALGO, HRV_CFG.algorithm, 0u);
 }
 
 
@@ -463,13 +474,13 @@ static void harvest_ivcurve_2_mppt_voc(uint32_t *const p_voltage_uV, uint32_t *c
     static uint32_t age_nxt = 0u;
 
     /* keep track of time, do  step = mod(step + 1, n) */
-    if (++interval_step >= cfg->interval_n) interval_step = 0u;
+    if (++interval_step >= HRV_CFG.interval_n) interval_step = 0u;
     age_nxt++;
     age_now++;
 
     /* lookout for new VOC */
-    if ((*p_current_nA < cfg->current_limit_nA) && (*p_voltage_uV <= voc_nxt) &&
-        (*p_voltage_uV >= voc_min) && (*p_voltage_uV <= cfg->voltage_max_uV))
+    if ((*p_current_nA < HRV_CFG.current_limit_nA) && (*p_voltage_uV <= voc_nxt) &&
+        (*p_voltage_uV >= voc_min) && (*p_voltage_uV <= HRV_CFG.voltage_max_uV))
     {
         voc_nxt = *p_voltage_uV;
         age_nxt = 0u;
@@ -481,17 +492,17 @@ static void harvest_ivcurve_2_mppt_voc(uint32_t *const p_voltage_uV, uint32_t *c
         age_now = age_nxt;
         voc_now = voc_nxt;
         age_nxt = 0u;
-        voc_nxt = cfg->voltage_max_uV;
+        voc_nxt = HRV_CFG.voltage_max_uV;
     }
 
     /* underlying cv-algo is doing the rest */
     harvest_ivcurve_2_cv(p_voltage_uV, p_current_nA);
 
     /* emulate VOC Search @ beginning of interval duration */
-    if (interval_step < cfg->duration_n)
+    if (interval_step < HRV_CFG.duration_n)
     {
         /* No Output here, also update wanted const voltage */
-        voltage_set_uV = mul32(voc_now, cfg->setpoint_n8) >> 8u;
+        voltage_set_uV = mul32(voc_now, HRV_CFG.setpoint_n8) >> 8u;
         *p_current_nA  = 0u;
     }
 }
@@ -505,7 +516,7 @@ static void harvest_ivcurve_2_mppt_po(uint32_t *const p_voltage_uV, uint32_t *co
     static uint64_t power_last = 0u;
 
     /* keep track of time, do  step = mod(step + 1, n) */
-    if (++interval_step >= cfg->interval_n) interval_step = 0u;
+    if (++interval_step >= HRV_CFG.interval_n) interval_step = 0u;
 
     /* underlying cv-algo is updating the current harvest-power */
     harvest_ivcurve_2_cv(p_voltage_uV, p_current_nA);
@@ -527,14 +538,14 @@ static void harvest_ivcurve_2_mppt_po(uint32_t *const p_voltage_uV, uint32_t *co
             {
                 /* lost tracking - or started with bad init */
                 is_rising      = 1u;
-                volt_step_uV   = cfg->voltage_step_uV;
+                volt_step_uV   = HRV_CFG.voltage_step_uV;
                 voltage_set_uV = sub32(voltage_set_uV, voltage_step_x4_uV);
             }
             else
             {
                 /* got less power -> reverse direction */
                 is_rising ^= 1u;
-                volt_step_uV = cfg->voltage_step_uV;
+                volt_step_uV = HRV_CFG.voltage_step_uV;
                 if (is_rising) voltage_set_uV = add32(voltage_set_uV, volt_step_uV);
                 else voltage_set_uV = sub32(voltage_set_uV, volt_step_uV);
             }
@@ -542,23 +553,23 @@ static void harvest_ivcurve_2_mppt_po(uint32_t *const p_voltage_uV, uint32_t *co
         power_last = power_now;
 
         /* check boundaries */
-        if (voltage_set_uV >= cfg->voltage_max_uV)
+        if (voltage_set_uV >= HRV_CFG.voltage_max_uV)
         {
-            voltage_set_uV = cfg->voltage_max_uV;
+            voltage_set_uV = HRV_CFG.voltage_max_uV;
             is_rising      = 0u;
-            volt_step_uV   = cfg->voltage_step_uV;
+            volt_step_uV   = HRV_CFG.voltage_step_uV;
         }
-        if (voltage_set_uV <= cfg->voltage_min_uV)
+        if (voltage_set_uV <= HRV_CFG.voltage_min_uV)
         {
-            voltage_set_uV = cfg->voltage_min_uV;
+            voltage_set_uV = HRV_CFG.voltage_min_uV;
             is_rising      = 1u;
-            volt_step_uV   = cfg->voltage_step_uV;
+            volt_step_uV   = HRV_CFG.voltage_step_uV;
         }
-        if (voltage_set_uV < cfg->voltage_step_uV)
+        if (voltage_set_uV < HRV_CFG.voltage_step_uV)
         {
-            voltage_set_uV = cfg->voltage_step_uV;
+            voltage_set_uV = HRV_CFG.voltage_step_uV;
             is_rising      = 1u;
-            volt_step_uV   = cfg->voltage_step_uV;
+            volt_step_uV   = HRV_CFG.voltage_step_uV;
         }
     }
 }
@@ -578,8 +589,8 @@ static void harvest_ivcurve_2_mppt_opt(uint32_t *const p_voltage_uV, uint32_t *c
 
     /* search for new max */
     const uint64_t power_fW = (uint64_t) (*p_voltage_uV) * (uint64_t) (*p_current_nA);
-    if ((power_fW >= power_nxt) && (*p_voltage_uV >= cfg->voltage_min_uV) &&
-        (*p_voltage_uV <= cfg->voltage_max_uV))
+    if ((power_fW >= power_nxt) && (*p_voltage_uV >= HRV_CFG.voltage_min_uV) &&
+        (*p_voltage_uV <= HRV_CFG.voltage_max_uV))
     {
         age_nxt     = 0u;
         power_nxt   = power_fW;

@@ -33,4 +33,9 @@ void     iep_set_cmp_val(uint8_ft compare_channel, uint32_t value);
 uint32_t iep_get_cmp_val(uint8_ft compare_channel);
 uint32_t iep_get_cnt_val();
 
+void     iep_set_compensation_inc(const uint32_t value);
+void     iep_compensate();
+void     iep_set_increment(const uint32_t value);
+
+
 #endif /* SHEPHERD_IEP_H_ */

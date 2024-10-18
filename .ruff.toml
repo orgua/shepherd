@@ -32,13 +32,14 @@ exclude= [  # external projects
 
 [lint.per-file-ignores]
 "*/tests/**" = ["ARG", "S", "D", "SLF001", "T201"]
-"*/examples/**" = ["INP001", "ERA001"]  # no namespace + commented-out code
-"software/shepherd-calibration/**" = ["ERA001"]  # comments
-"software/debug_analyze_time_sync/**" = ["ERA001", "S301"]  # comments
-"software/shepherd-devicetest/**" = ["ERA001", "ARG001", "PLW0603", "F405", "F403", "ANN001"]
-"software/python-package/shepherd_sheep/shepherd_debug.py" = ["FBT001", "FBT002"]
-"software/shepherd-calibration/shepherd_cal/**" = ["FBT003"]  # rpc had trouble with named params
+"*/examples/**" = ["INP001", "ERA001"]  # no namespace & commented-out code
 "docs/**" = ["INP001"]
+"software/debug_analyze_time_sync/**" = ["ERA001", "S301"]  # comments
+"software/kernel-module/**" = ["INP001", "T201", "ERA001"]  # no namespace, print & commented-out code
+"software/python-package/shepherd_sheep/shepherd_debug.py" = ["FBT001", "FBT002"]
+"software/shepherd-calibration/**" = ["ERA001"]  # comments
+"software/shepherd-calibration/shepherd_cal/**" = ["FBT003"]  # rpc had trouble with named params
+"software/shepherd-devicetest/**" = ["ERA001", "ARG001", "PLW0603", "F405", "F403", "ANN001"]
 
 [lint.mccabe]
 # Unlike Flake8, default to a complexity level of 10.

@@ -77,6 +77,16 @@ inline uint32_t iep_get_cmp_val(const uint8_ft compare_channel)
     return *((uint32_t *) &CT_IEP + 18U + compare_channel);
 }
 
+inline void iep_compensate() { CT_IEP.TMR_COMPEN_bit.COMPEN_CNT = 1u; }
+
+inline void iep_set_compensation_inc(const uint32_t value)
+{
+    CT_IEP.TMR_GLB_CFG_bit.CMP_INC = value;
+}
+
+
+inline void iep_set_increment(const uint32_t value) { CT_IEP.TMR_GLB_CFG_bit.DEFAULT_INC = value; }
+
 inline uint32_t iep_get_cnt_val() { return CT_IEP.TMR_CNT; }
 
 void            iep_init()

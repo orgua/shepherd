@@ -39,17 +39,23 @@
 #include "resource_table.h"
 
 #include "commons.h"
-#include "ringbuffer.h"
 
 /* Definition for unused interrupts */
-#define HOST_UNUSED   (255U)
+#define HOST_UNUSED (255U)
 
-#define SIZE_CARVEOUT (FIFO_BUFFER_SIZE * sizeof(struct SampleBuffer))
+#define SIZE_CARVEOUT                                                                              \
+    (sizeof(struct IVTraceInp) + sizeof(struct IVTraceOut) + sizeof(struct GPIOTrace) +            \
+     sizeof(struct UtilTrace))
 
-// pseudo-assertion to test for correct struct-size, zero cost
-extern uint32_t CHECK_CARVEOUT[1 / (SIZE_CARVEOUT >=
-                                    FIFO_BUFFER_SIZE * (4 + 4 + 8 + 2 * 4 * 10000 +
-                                                        (4 + 4 + (8 + 2) * 16384) + 2 * 4))];
+// pseudo-assertion to test for correct struct-size, zero cost -> signoff changes here
+/* // removed - there are better control structures by now (canaries)
+extern uint32_t
+        CHECK_CARVEOUT[1 / (SIZE_CARVEOUT == ((2u * 4u + (1000000u) * (4u + 4u)) +      // IV-INP
+                                              (2u * 4u + (1000000u) * (8u + 4u + 4u)) + // IV-OUT
+                                              (2u * 4u + (1000000u) * (8u + 2u)) +      // GPIO
+                                              (2u * 4u + (400u) * (8u + 4u * 4u))  // Util
+                                              ))];
+*/
 
 #if !defined(__GNUC__)
   #pragma DATA_SECTION(resourceTable, ".resource_table")
@@ -67,13 +73,13 @@ struct my_resource_table resourceTable = {
         },
         /* offsets to entries */
         {
-                offsetof(struct my_resource_table, shared_mem),
+                offsetof(struct my_resource_table, shared_memory),
         },
 
         /* resource entries */
         {TYPE_CARVEOUT, 0x0, /* Memory address */
          0x0,                /* Physical address */
-         SIZE_CARVEOUT,      /* ~ 15 MB */
+         SIZE_CARVEOUT,      /* ~ 34 MB */
          0,                  /* Flags */
          0,                  /* Reserved */
          "PRU_HOST_SHARED_MEM"},

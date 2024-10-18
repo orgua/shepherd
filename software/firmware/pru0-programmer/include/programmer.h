@@ -3,6 +3,6 @@
 
 #include "commons.h"
 
-void programmer(volatile struct SharedMem *shared_mem, volatile struct SampleBuffer *buffers_far);
+void programmer(volatile struct ProgrammerCtrl *const pctrl, const uint32_t *const fw_data);
 
 #endif //PRU_FIRMWARE_PRU0_INCLUDE_PROGRAMMER_H
