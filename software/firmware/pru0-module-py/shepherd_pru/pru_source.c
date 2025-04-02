@@ -12,7 +12,7 @@ ripped out parts from sample_emulator() in sampling.c
 uint32_t vsrc_iterate_sampling(uint32_t input_voltage_uV, uint32_t input_current_nA,
                                const uint32_t current_adc_raw)
 {
-    static struct SharedMem shared_mem;
+    static struct SharedMem shared_mem; // TODO: update
 
     sample_ivcurve_harvester(&input_voltage_uV, &input_current_nA);
 
@@ -22,7 +22,7 @@ uint32_t vsrc_iterate_sampling(uint32_t input_voltage_uV, uint32_t input_current
 
     converter_update_cap_storage();
 
-    converter_update_states_and_output(&shared_mem);
+    converter_update_states_and_output(&shared_mem); // TODO: update
 
     /* feedback path - important for boost-less circuits */
     if (feedback_to_hrv) { voltage_set_uV = V_input_request_uV; }

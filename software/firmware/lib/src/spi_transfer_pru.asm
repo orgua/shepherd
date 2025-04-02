@@ -54,7 +54,11 @@ adc_io_loop_end:
 
 
 
-    .global adc_fastread ; code performs with 33-40 MHz (18 bit read), ~ 450-550 ns CS low
+    .global adc_fastread
+    ; 1 x NOP: code performs with 33-40 MHz (18 bit read), ~ 450-550 ns CS low
+    ; 3 x NOP: 200 MHz PRU / 7 Ops = 28.6 MHz, ~ 650 ns CS low
+    ; 5 x NOP: 22 MHz for readloop, ~ 836 ns CS Low
+    ; NOTE: currently only the 5NOP-Version works reliably
 adc_fastread:
     MOV r24, r14 ; Save input arg (CS pin)
     LDI r20, 18 ; Load Counter for loop
@@ -62,15 +66,15 @@ adc_fastread:
     CLR r30, r30, MOSI ; Set MOSI low
     CLR r30, r30, r24 ; Set CS low
 
-adc_readloop_head: ; 5 - 6 ticks, depending on input, TODO: 1 NOP to spare, 50 MHz would be possible
+adc_readloop_head: ; 5 - 6 ticks, depending on input
     loop adc_loop_end, r20 ; start hw-assisted loop (zero overhead)
-    NOP ; TODO: only temporary - due to trouble to receive data
-    NOP ; TODO: only temporary - due to trouble to receive data
+    NOP ; spare
+    NOP ; spare
     CLR r30, r30, SCLK ; Set SCLK low
     SUB r20, r20, 1 ; decrement shiftloop counter
     NOP
-    NOP ; TODO: only temporary - due to trouble to receive data
-    NOP ; TODO: only temporary - due to trouble to receive data
+    NOP ; spare
+    NOP ; spare
     SET r30, r30, SCLK ; Set SCLK High
     QBBC adc_loop_end, r31, MISO
 adc_miso_set:

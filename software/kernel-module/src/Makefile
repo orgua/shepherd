@@ -8,6 +8,7 @@ ifneq ($(KERNELRELEASE),)
     $(TARGET_MODULE)-objs += pru_firmware.o
     $(TARGET_MODULE)-objs += pru_mem_interface.o
     $(TARGET_MODULE)-objs += pru_msg_sys.o
+    $(TARGET_MODULE)-objs += ocmc_cache.o
     $(TARGET_MODULE)-objs += pru_sync_control.o
     $(TARGET_MODULE)-objs += sysfs_interface.o
 else

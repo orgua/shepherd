@@ -40,7 +40,7 @@ from .sysfs_interface import check_sys_access
 from .sysfs_interface import flatten_list
 from .target_io import TargetIO
 
-__version__ = "0.8.4"
+__version__ = "0.9.0"
 
 __all__ = [
     "EEPROM",
@@ -156,6 +156,7 @@ def run_programmer(cfg: ProgrammingTask, rate_factor: float = 1.0) -> bool:
         path_tmp = tempfile.TemporaryDirectory()
         stack.enter_context(path_tmp)
         file_tmp = Path(path_tmp.name) / "aligned.hex"
+        log.debug("\taligned firmware")
         # tmp_path because firmware can be in readonly content-dir
         cmd = [
             "/usr/bin/srec_cat",
@@ -184,6 +185,7 @@ def run_programmer(cfg: ProgrammingTask, rate_factor: float = 1.0) -> bool:
             log.error("Error during realignment (srec_cat): %s", ret.stderr)
             failed = True
             raise SystemExit  # noqa: TRY301
+        log.debug("\tconverted to ihex")
 
         if not (0.1 <= rate_factor <= 1.0):
             raise ValueError("Scaler for data-rate must be between 0.1 and 1.0")
@@ -215,9 +217,9 @@ def run_programmer(cfg: ProgrammingTask, rate_factor: float = 1.0) -> bool:
                     "Programmer initialized, will start now (data-rate = %d bit/s)", _data_rate
                 )
                 sysfs_interface.start_programmer()
-            except OSError:
-                log.error("OSError - Failed to initialize Programmer")
-                failed = True
+            # except OSError as xpt:
+            #    log.exception("OSError - Failed to initialize Programmer", str(xpt))
+            #    failed = True
             except ValueError as xpt:
                 log.exception("ValueError: %s", str(xpt))
                 failed = True

@@ -49,11 +49,9 @@
 #if (DEBUG_RAMRD_EN > 0)
   #define DEBUG_RAMRD_STATE_0 DEBUG_STATE_0
   #define DEBUG_RAMRD_STATE_1 DEBUG_STATE_1
-  #define DEBUG_RAMRD_STATE_2 DEBUG_STATE_2
 #else
   #define DEBUG_RAMRD_STATE_0
   #define DEBUG_RAMRD_STATE_1
-  #define DEBUG_RAMRD_STATE_2
 #endif
 
 
@@ -75,7 +73,7 @@ static void inline shift_gpio(const uint32_t number)
 }
 
 // analyze ticks between fn-calls (=time in loop), and output values for min, mean, max on debug pins
-static void inline debug_loop_delays(const uint32_t shepherd_state)
+static void inline debug_loop_delays(const uint32_t shp_pru_state)
 {
     static uint32_t ticks_last  = 0;
     static uint32_t ticks_max   = 0;
@@ -83,7 +81,7 @@ static void inline debug_loop_delays(const uint32_t shepherd_state)
     static uint32_t ticks_sum   = 0;
     static uint32_t ticks_count = 0;
 
-    if (shepherd_state == STATE_RUNNING)
+    if (shp_pru_state == STATE_RUNNING)
     {
         const uint32_t ticks_current = CT_IEP.TMR_CNT;
         if (ticks_last > ticks_current)

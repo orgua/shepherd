@@ -17,7 +17,7 @@
       ansible.builtin.command: "date -s {{ local_time.stdout }}"
       changed_when: true
 
-- name: Role - PTP-Client only (not recommended! all should be server as well)
+- name: Role - PTP-Client only
   hosts: ptp_clients
   become: true
   strategy: free # noqa: run-once[play]

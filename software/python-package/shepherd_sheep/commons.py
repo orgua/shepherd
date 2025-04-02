@@ -7,11 +7,34 @@ corresponding implementation in `software/firmware/include/commons.h`
 
 """
 
-MAX_GPIO_EVT_PER_BUFFER = 16_384  # 2^14
-# TODO: replace by (currently non-existing) sysfs_interface
+# ############################################################################
+# PRU - CONFIG  ##############################################################
+# ############################################################################
 
-MSG_BUF_FROM_HOST = 0x01
-MSG_BUF_FROM_PRU = 0x02
+# The IEP of the PRUs is clocked with 200 MHz -> 5 nanoseconds per tick
+TICK_INTERVAL_NS: int = 5
+SAMPLE_INTERVAL_NS: int = 10_000
+SAMPLE_INTERVAL_S: float = SAMPLE_INTERVAL_NS * 1e-9
+SAMPLE_INTERVAL_TICKS: int = SAMPLE_INTERVAL_NS // TICK_INTERVAL_NS
+SYNC_INTERVAL_NS: int = 100_000_000
+SYNC_INTERVAL_TICKS: int = SYNC_INTERVAL_NS // TICK_INTERVAL_NS
+SAMPLES_PER_SYNC: int = SYNC_INTERVAL_NS // SAMPLE_INTERVAL_NS
+
+# Length of buffer for storing harvest & emulation, gpio- and util- data
+BUFFER_IV_SIZE: int = 1_000_000  # for ~10s
+BUFFER_IV_INTERVAL_MS: int = BUFFER_IV_SIZE * SAMPLE_INTERVAL_NS // 10**6
+BUFFER_GPIO_SIZE: int = 1_000_000
+BUFFER_UTIL_SIZE: int = 400
+IDX_OUT_OF_BOUND: int = 0xFFFFFFFF
+
+CANARY_VALUE_U32: int = 0xDEBAC1E5  # read as '0-debacles'
+
+# ############################################################################
+# PRU - COMMONS  #############################################################
+# ############################################################################
+
+MSG_PRU0_ENTER_ROUTINE = 0x12
+MSG_PRU0_EXIT_ROUTINE = 0x13
 
 MSG_PGM_ERROR_WRITE = 0x93  # val0: addr, val1: data
 MSG_PGM_ERROR_VERIFY = 0x94  # val0: addr, val1: data(original)
@@ -33,30 +56,20 @@ MSG_DBG_VSRC_DRAIN = 0xAE
 MSG_DBG_FN_TESTS = 0xAF
 MSG_DBG_VSRC_HRV_P_INP = 0xB1
 
-# TODO: these 9 lines below are replaced by the following dict
-MSG_ERROR = 0xE0
-MSG_ERR_MEMCORRUPTION = 0xE1
-MSG_ERR_BACKPRESSURE = 0xE2
-MSG_ERR_INCMPLT = 0xE3  # TODO: could be removed, not possible anymore
-MSG_ERR_INVLDCMD = 0xE4
-MSG_ERR_NOFREEBUF = 0xE5
-MSG_ERR_TIMESTAMP = 0xE6
-MSG_ERR_SYNC_STATE_NOT_IDLE = 0xE7
-MSG_ERR_VALUE = 0xE8
-
 # NOTE: below messages are exclusive to kernel space
 MSG_STATUS_RESTARTING_ROUTINE = 0xF0
 
 pru_errors: dict[int, str] = {
-    0xE0: "General (unspecified) PRU-error [MSG_ERROR]",
-    0xE1: "PRU received a faulty msg.id from kernel [MSG_ERR_MEMCORRUPTION]",
-    0xE2: "PRUs msg-buffer to kernel still full [MSG_ERR_BACKPRESSURE]",
-    0xE3: "PRU got an incomplete buffer [MSG_ERR_INCMPLT]",
-    0xE4: "PRU received an invalid command [MSG_ERR_INVLDCMD]",
-    0xE5: "PRU ran out of buffers [MSG_ERR_NOFREEBUF]",
-    0xE6: "PRU received a faulty timestamp [MSG_ERR_TIMESTAMP]",
-    0xE7: "PRUs sync-state not idle at host interrupt [MSG_ERR_SYNC_STATE_NOT_IDLE]",
-    0xE8: "PRUs msg-content failed test [MSG_ERR_VALUE]",
+    0xE0: "[ERR_INVLD_CMD] PRU received an invalid command",
+    0xE1: "[ERR_MEM_CORRUPTION] PRU received a faulty msg.id from kernel",
+    0xE2: "[ERR_BACKPRESSURE] PRUs msg-buffer to kernel still full",
+    0xE3: "[ERR_TIMESTAMP] PRU received a faulty timestamp",
+    0xE4: "[ERR_CANARY] kernel / pru detected a dead canary",
+    0xE5: "[ERR_SYNC_STATE_NOT_IDLE] PRUs sync-state not idle at host interrupt",
+    0xE6: "[ERR_VALUE] PRUs msg-content failed test",
+    0xE7: "[ERR_SAMPLE_MODE] no valid sample mode found",
+    0xE8: "[ERR_HRV_ALGO] no valid hrv algo found",
+    0xE9: "[ERR_ADC_NOT_FOUND] PRU failed to read back from ADC -> is cape powered?",
 }
 
 # fmt: off

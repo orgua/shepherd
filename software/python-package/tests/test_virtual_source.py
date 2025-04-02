@@ -47,6 +47,7 @@ def pru_vsource(
             log_intermediate=False,
             dtype_in=dtype_in,
             window_size=window_size,
+            voltage_step_V=1e-3,  # totally random
         )  # TODO: extend to be real vsource
         yield _d
 

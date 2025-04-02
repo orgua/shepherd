@@ -6,10 +6,14 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
+#include <linux/of_irq.h>      // TODO: test
+#include <linux/of_platform.h> // todo: test
 #include <linux/platform_device.h>
+#include <linux/pruss.h> // todo: test
 #include <linux/remoteproc.h>
 #include <linux/types.h>
 
+#include "ocmc_cache.h"
 #include "pru_firmware.h"
 #include "pru_mem_interface.h"
 #include "pru_msg_sys.h"
@@ -77,14 +81,12 @@ static int prepare_shepherd_platform_data(struct platform_device *pdev)
             if (strncmp(tmp_rproc->name, "4a334000.pru", 12) == 0)
             {
                 printk(KERN_INFO "shprd.k: Found PRU0 at phandle 0x%02X", child->phandle);
-
                 shp_pdata->rproc_prus[0] = tmp_rproc;
             }
 
             else if (strncmp(tmp_rproc->name, "4a338000.pru", 12) == 0)
             {
                 printk(KERN_INFO "shprd.k: Found PRU1 at phandle 0x%02X", child->phandle);
-
                 shp_pdata->rproc_prus[1] = tmp_rproc;
             }
         }
@@ -115,7 +117,9 @@ static int shepherd_drv_probe(struct platform_device *pdev)
     msg_sys_init();
 
     /* Initialize synchronization mechanism between PRU1 and our clock */
-    sync_init(mem_interface_get_buffer_period_ns());
+    sync_init();
+
+    // ocmc_cache_init();  // TODO: tempory
 
     /* Set up the sysfs interface for access from userspace */
     sysfs_interface_init();
@@ -125,24 +129,45 @@ static int shepherd_drv_probe(struct platform_device *pdev)
 
 static int shepherd_drv_remove(struct platform_device *pdev)
 {
-    struct shepherd_platform_data *pdata;
-
-    pdata = pdev->dev.platform_data;
     sysfs_interface_exit();
+    // ocmc_cache_exit();   // TODO: tempory
     msg_sys_exit();
     sync_exit();
     mem_interface_exit();
 
-    if (pdata != NULL)
+    if (shp_pdata != NULL)
     {
-        rproc_shutdown(pdata->rproc_prus[0]);
-        rproc_put(pdata->rproc_prus[0]);
-        rproc_shutdown(pdata->rproc_prus[1]);
-        rproc_put(pdata->rproc_prus[1]);
-        devm_kfree(&pdev->dev, pdev->dev.platform_data);
+        if (shp_pdata->rproc_prus[1]->state == RPROC_RUNNING)
+        {
+            rproc_shutdown(shp_pdata->rproc_prus[1]);
+            printk(KERN_INFO "shprd.k: PRU1 shut down");
+        }
+        if (shp_pdata->rproc_prus[0]->state == RPROC_RUNNING)
+        {
+            rproc_shutdown(shp_pdata->rproc_prus[0]);
+            printk(KERN_INFO "shprd.k: PRU0 shut down");
+        }
+        // pt->pruss = pruss_get(pt->pru); // struct pruss *
+        //pruss_release_mem_region(pt->pruss, &pt->mem);
+        pruss_put(pruss_get(shp_pdata->rproc_prus[0]));
+        pruss_put(pruss_get(shp_pdata->rproc_prus[1]));
+        printk(KERN_INFO "shprd.k: prusses returned");
+        // there is rproc_free(),
+        pru_rproc_put(shp_pdata->rproc_prus[0]);
+        pru_rproc_put(shp_pdata->rproc_prus[1]);
+        rproc_put(shp_pdata->rproc_prus[0]);
+        //rproc_put(shp_pdata->rproc_prus[1]);
+        shp_pdata->rproc_prus[0] = NULL;
+        shp_pdata->rproc_prus[1] = NULL;
+        printk(KERN_INFO "shprd.k: PRU-handles returned");
+        devm_kfree(&pdev->dev, shp_pdata);
+        printk(KERN_INFO "shprd.k: platform-data 1 freed");
+        shp_pdata               = NULL;
         pdev->dev.platform_data = NULL;
+        printk(KERN_INFO "shprd.k: platform-data 2 nulled");
     }
-
+    // TODO: testing-ground - module will not fully exit with
+    //  "modprobe: FATAL: Module remoteproc is in use."
     platform_set_drvdata(pdev, NULL);
     printk(KERN_INFO "shprd.k: module exited from kernel!!!");
     return 0;
@@ -165,5 +190,5 @@ module_platform_driver(shepherd_driver);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Kai Geissdoerfer");
 MODULE_DESCRIPTION("Shepherd kernel module for time synchronization and data exchange to PRUs");
-MODULE_VERSION("0.8.4");
+MODULE_VERSION("0.9.0");
 // MODULE_ALIAS("rpmsg:rpmsg-shprd"); // TODO: is this still needed?

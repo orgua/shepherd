@@ -4,9 +4,11 @@
 #include "hw_config.h"
 #include "math64_safe.h"
 #include "stdint_fast.h"
+#include <stddef.h>
 #include <stdint.h>
 
 #include "fw_config.h"
+#include "shared_mem.h"
 
 /* ---------------------------------------------------------------------
  * Virtual Converter, TODO: update description
@@ -66,41 +68,41 @@ struct ConverterState
 };
 
 /* feedback to harvester - global vars */
-bool_ft                                       feedback_to_hrv    = 0u;
-uint32_t                                      V_input_request_uV = 0u;
+bool_ft                      feedback_to_hrv    = 0u;
+uint32_t                     V_input_request_uV = 0u;
 
 /* (local) global vars to access in update function */
-static struct ConverterState                  state;
-static const volatile struct ConverterConfig *cfg;
+static struct ConverterState state;
+#define CNV_CFG                                                                                    \
+    (*((volatile struct ConverterConfig *) (PRU_SHARED_MEM_OFFSET +                                \
+                                            offsetof(struct SharedMem, converter_settings))))
 
-void converter_initialize(const volatile struct ConverterConfig *const config)
+void converter_initialize()
 {
-    /* Initialize state */
-    cfg                                     = config;
-
     /* Power-flow in and out of system */
     state.V_input_uV                        = 0u; // TODO: is it used?
     state.P_inp_fW_n8                       = 0ull;
     state.P_out_fW_n4                       = 0ull;
-    state.interval_startup_disabled_drain_n = cfg->interval_startup_delay_drain_n;
+    state.interval_startup_disabled_drain_n = CNV_CFG.interval_startup_delay_drain_n;
 
     /* container for the stored energy: */
-    state.V_mid_uV_n32                      = ((uint64_t) cfg->V_intermediate_init_uV) << 32u;
+    state.V_mid_uV_n32                      = ((uint64_t) CNV_CFG.V_intermediate_init_uV) << 32u;
 
     /* Buck Boost */
-    state.enable_storage                    = (cfg->converter_mode & 0b0001) > 0;
-    state.enable_boost                      = (cfg->converter_mode & 0b0010) > 0;
-    state.enable_buck                       = (cfg->converter_mode & 0b0100) > 0;
-    state.enable_log_mid                    = (cfg->converter_mode & 0b1000) > 0;
+    state.enable_storage                    = (CNV_CFG.converter_mode & 0b0001) > 0;
+    state.enable_boost                      = (CNV_CFG.converter_mode & 0b0010) > 0;
+    state.enable_buck                       = (CNV_CFG.converter_mode & 0b0100) > 0;
+    state.enable_log_mid                    = (CNV_CFG.converter_mode & 0b1000) > 0;
 
-    state.V_out_dac_uV                      = cfg->V_output_uV;
-    state.V_out_dac_raw                     = cal_conv_uV_to_dac_raw(cfg->V_output_uV);
+    state.V_out_dac_uV                      = CNV_CFG.V_output_uV;
+    state.V_out_dac_raw                     = cal_conv_uV_to_dac_raw(CNV_CFG.V_output_uV);
     state.power_good                        = true;
 
     /* prepare hysteresis-thresholds */
-    state.dV_enable_output_uV_n32           = ((uint64_t) cfg->dV_enable_output_uV) << 32u;
-    state.V_enable_output_threshold_uV_n32  = ((uint64_t) cfg->V_enable_output_threshold_uV) << 32u;
-    state.V_disable_output_threshold_uV_n32 = ((uint64_t) cfg->V_disable_output_threshold_uV)
+    state.dV_enable_output_uV_n32           = ((uint64_t) CNV_CFG.dV_enable_output_uV) << 32u;
+    state.V_enable_output_threshold_uV_n32  = ((uint64_t) CNV_CFG.V_enable_output_threshold_uV)
+                                             << 32u;
+    state.V_disable_output_threshold_uV_n32 = ((uint64_t) CNV_CFG.V_disable_output_threshold_uV)
                                               << 32u;
 
     if (state.dV_enable_output_uV_n32 > state.V_enable_output_threshold_uV_n32)
@@ -111,8 +113,8 @@ void converter_initialize(const volatile struct ConverterConfig *const config)
     }
 
     /* feedback to harvester */
-    feedback_to_hrv    = (cfg->converter_mode & 0b10000) > 0u;
-    V_input_request_uV = cfg->V_intermediate_init_uV;
+    feedback_to_hrv    = (CNV_CFG.converter_mode & 0b10000) > 0u;
+    V_input_request_uV = CNV_CFG.V_intermediate_init_uV;
 
     /* compensate for (hard to detect) current-surge of real capacitors when converter gets turned on
 	 * -> this can be const value, because the converter always turns on with "V_intermediate_enable_threshold_uV"
@@ -127,12 +129,12 @@ void converter_initialize(const volatile struct ConverterConfig *const config)
 	 * in case of V_cap = V_out 	-> 	dV = V_store_old * (sqrt(1 - C_out / C_store) - 1)
 	 */
     /*
-	const ufloat V_old_sq_uV = mul0(cfg.V_intermediate_enable_threshold_uV, 0, cfg.V_intermediate_enable_threshold_uV, 0);
+	const ufloat V_old_sq_uV = mul0(CNV_CFG.V_intermediate_enable_threshold_uV, 0, CNV_CFG.V_intermediate_enable_threshold_uV, 0);
 	const ufloat V_out_sq_uV = mul2(state.V_out_dac_uV, state.V_out_dac_uV);
-	const ufloat cap_ratio   = div0(cfg.C_output_nF, 0, cfg.C_storage_nF, 0);
+	const ufloat cap_ratio   = div0(CNV_CFG.C_output_nF, 0, CNV_CFG.C_storage_nF, 0);
 	const ufloat V_new_sq_uV = sub2(V_old_sq_uV, mul2(cap_ratio, V_out_sq_uV));
 	GPIO_ON(DEBUG_PIN1_MASK);
-	state.dV_stor_en_uV = sub1r(cfg.V_intermediate_enable_threshold_uV, 0, sqrt_rounded(V_new_sq_uV)); // reversed, because new voltage is lower then old
+	state.dV_stor_en_uV = sub1r(CNV_CFG.V_intermediate_enable_threshold_uV, 0, sqrt_rounded(V_new_sq_uV)); // reversed, because new voltage is lower then old
 	*/
     // TODO: add tests for valid ranges -> not here
     // TODO: redo unit-test so that normal emulation is used, no special messages anymore (or substantially less)
@@ -157,21 +159,21 @@ void converter_calc_inp_power(uint32_t input_voltage_uV, uint32_t input_current_
     // NOTE: p_inp_fW could be calculated in python, even with efficiency-interpolation -> hand voltage and power to pru
     /* BOOST, Calculate current flowing into the storage capacitor */
     //GPIO_TOGGLE(DEBUG_PIN1_MASK);
-    if (input_voltage_uV > cfg->V_input_drop_uV) { input_voltage_uV -= cfg->V_input_drop_uV; }
+    if (input_voltage_uV > CNV_CFG.V_input_drop_uV) { input_voltage_uV -= CNV_CFG.V_input_drop_uV; }
     else { input_voltage_uV = 0u; }
 
-    if (input_voltage_uV > cfg->V_input_max_uV) { input_voltage_uV = cfg->V_input_max_uV; }
+    if (input_voltage_uV > CNV_CFG.V_input_max_uV) { input_voltage_uV = CNV_CFG.V_input_max_uV; }
 
-    if (input_current_nA > cfg->I_input_max_nA) { input_current_nA = cfg->I_input_max_nA; }
+    if (input_current_nA > CNV_CFG.I_input_max_nA) { input_current_nA = CNV_CFG.I_input_max_nA; }
 
     state.V_input_uV = input_voltage_uV;
 
     if (state.enable_boost)
     {
         /* disable boost if input voltage too low for boost to work, TODO: is this also in 65ms interval? */
-        if (input_voltage_uV < cfg->V_input_boost_threshold_uV) { input_voltage_uV = 0u; }
+        if (input_voltage_uV < CNV_CFG.V_input_boost_threshold_uV) { input_voltage_uV = 0u; }
 
-        // if (input_voltage_uV > (state.V_mid_uV_n32 >> 32u) + cfg->V_input_drop_uV)
+        // if (input_voltage_uV > (state.V_mid_uV_n32 >> 32u) + CNV_CFG.V_input_drop_uV)
         // TODO: vdrop in case of v_input > v_storage (non-boost)?
     }
     else if (state.enable_storage)
@@ -181,7 +183,7 @@ void converter_calc_inp_power(uint32_t input_voltage_uV, uint32_t input_current_
         const uint32_t V_diff_uV =
                 (input_voltage_uV >= V_mid_uV) ? input_voltage_uV - V_mid_uV : 0u;
         const uint32_t V_res_drop_uV =
-                (uint32_t) (((uint64_t) input_current_nA * (uint64_t) cfg->R_input_kOhm_n22) >>
+                (uint32_t) (((uint64_t) input_current_nA * (uint64_t) CNV_CFG.R_input_kOhm_n22) >>
                             22u);
         if (V_res_drop_uV > V_diff_uV) { input_voltage_uV = V_mid_uV; }
         else { input_voltage_uV -= V_res_drop_uV; }
@@ -189,7 +191,7 @@ void converter_calc_inp_power(uint32_t input_voltage_uV, uint32_t input_current_
         if (feedback_to_hrv)
         {
             // IF input==ivcurve request new CV
-            V_input_request_uV = V_mid_uV + V_res_drop_uV + cfg->V_input_drop_uV;
+            V_input_request_uV = V_mid_uV + V_res_drop_uV + CNV_CFG.V_input_drop_uV;
         }
         else if (input_voltage_uV < V_mid_uV)
         {
@@ -225,7 +227,7 @@ void converter_calc_out_power(const uint32_t current_adc_raw)
     //GPIO_TOGGLE(DEBUG_PIN1_MASK);
     /* BUCK, Calculate current flowing out of the storage capacitor */
     const uint64_t V_mid_uV_n4  = (state.V_mid_uV_n32 >> 28u);
-    const uint64_t P_leak_fW_n4 = mul64(cfg->I_intermediate_leak_nA, V_mid_uV_n4);
+    const uint64_t P_leak_fW_n4 = mul64(CNV_CFG.I_intermediate_leak_nA, V_mid_uV_n4);
     const uint32_t I_out_nA     = cal_conv_adc_raw_to_nA(current_adc_raw);
     const uint32_t eta_inv_out_n4 =
             (state.enable_buck) ? get_output_inv_efficiency_n4(I_out_nA) : (1u << 4u);
@@ -256,21 +258,21 @@ void converter_update_cap_storage(void)
         if (P_inp_fW_n4 > state.P_out_fW_n4)
         {
             const uint64_t I_mid_nA_n4   = div_uV_n4(P_inp_fW_n4 - state.P_out_fW_n4, V_mid_uV);
-            const uint64_t dV_mid_uV_n32 = mul64(cfg->Constant_us_per_nF_n28, I_mid_nA_n4);
+            const uint64_t dV_mid_uV_n32 = mul64(CNV_CFG.Constant_us_per_nF_n28, I_mid_nA_n4);
             state.V_mid_uV_n32           = add64(state.V_mid_uV_n32, dV_mid_uV_n32);
         }
         else
         {
             const uint64_t I_mid_nA_n4   = div_uV_n4(state.P_out_fW_n4 - P_inp_fW_n4, V_mid_uV);
-            const uint64_t dV_mid_uV_n32 = mul64(cfg->Constant_us_per_nF_n28, I_mid_nA_n4);
+            const uint64_t dV_mid_uV_n32 = mul64(CNV_CFG.Constant_us_per_nF_n28, I_mid_nA_n4);
             state.V_mid_uV_n32           = sub64(state.V_mid_uV_n32, dV_mid_uV_n32);
         }
     }
 
     // Make sure the voltage stays in it's boundaries, TODO: is this also in 65ms interval?
-    if ((uint32_t) (state.V_mid_uV_n32 >> 32u) > cfg->V_intermediate_max_uV)
+    if ((uint32_t) (state.V_mid_uV_n32 >> 32u) > CNV_CFG.V_intermediate_max_uV)
     {
-        state.V_mid_uV_n32 = ((uint64_t) cfg->V_intermediate_max_uV) << 32u;
+        state.V_mid_uV_n32 = ((uint64_t) CNV_CFG.V_intermediate_max_uV) << 32u;
     }
     if ((uint32_t) (state.V_mid_uV_n32 >> 32u) < 1u)
     {
@@ -280,14 +282,16 @@ void converter_update_cap_storage(void)
 }
 
 // TODO: not optimized
-uint32_t converter_update_states_and_output(volatile struct SharedMem *const shared_mem)
+uint32_t converter_update_states_and_output()
 {
     //GPIO_TOGGLE(DEBUG_PIN1_MASK);
 
     /* connect or disconnect output on certain events */
     static uint32_t sample_count     = 0xFFFFFFF0u;
-    static bool_ft  is_outputting    = true;
-    const bool_ft   check_thresholds = (++sample_count >= cfg->interval_check_thresholds_n);
+    static bool_ft  is_outputting    = false;
+    const bool_ft   check_thresholds = (++sample_count >= CNV_CFG.interval_check_thresholds_n);
+    const uint32_t  V_mid_uV         = (uint32_t) (state.V_mid_uV_n32 >> 32u);
+    // this local copy also avoids not enabling pwr_good (due to large dV_enable_output_uV)
 
     if (check_thresholds)
     {
@@ -310,33 +314,32 @@ uint32_t converter_update_states_and_output(volatile struct SharedMem *const sha
         }
     }
 
-    const uint32_t V_mid_uV = (uint32_t) (state.V_mid_uV_n32 >> 32u);
-
-    if (check_thresholds || cfg->immediate_pwr_good_signal)
+    if (check_thresholds || CNV_CFG.immediate_pwr_good_signal)
     {
         /* emulate power-good-signal */
         if (state.power_good)
         {
-            if (V_mid_uV <= cfg->V_pwr_good_disable_threshold_uV) { state.power_good = false; }
+            if (V_mid_uV <= CNV_CFG.V_pwr_good_disable_threshold_uV) { state.power_good = false; }
         }
         else
         {
-            if (V_mid_uV >= cfg->V_pwr_good_enable_threshold_uV)
+            if (V_mid_uV >= CNV_CFG.V_pwr_good_enable_threshold_uV)
             {
                 state.power_good = is_outputting;
             }
         }
-        set_batok_pin(shared_mem, state.power_good);
+        set_batok_pin(state.power_good);
     }
 
     if (is_outputting || (state.interval_startup_disabled_drain_n > 0u))
     {
-        if ((state.enable_buck == false) || (V_mid_uV <= cfg->V_output_uV + cfg->V_buck_drop_uV))
+        if ((state.enable_buck == false) ||
+            (V_mid_uV <= CNV_CFG.V_output_uV + CNV_CFG.V_buck_drop_uV))
         {
             state.V_out_dac_uV =
-                    (V_mid_uV > cfg->V_buck_drop_uV) ? V_mid_uV - cfg->V_buck_drop_uV : 0u;
+                    (V_mid_uV > CNV_CFG.V_buck_drop_uV) ? V_mid_uV - CNV_CFG.V_buck_drop_uV : 0u;
         }
-        else { state.V_out_dac_uV = cfg->V_output_uV; }
+        else { state.V_out_dac_uV = CNV_CFG.V_output_uV; }
         state.V_out_dac_raw = cal_conv_uV_to_dac_raw(state.V_out_dac_uV);
     }
     else
@@ -347,8 +350,8 @@ uint32_t converter_update_states_and_output(volatile struct SharedMem *const sha
     }
 
     // helps to prevent jitter-noise in gpio-traces
-    shared_mem->vsource_skip_gpio_logging =
-            (state.V_out_dac_uV < cfg->V_output_log_gpio_threshold_uV);
+    SHARED_MEM.vsource_skip_gpio_logging =
+            (state.V_out_dac_uV < CNV_CFG.V_output_log_gpio_threshold_uV);
 
     //GPIO_TOGGLE(DEBUG_PIN1_MASK);
     /* output proper voltage to dac */
@@ -359,20 +362,20 @@ uint32_t converter_update_states_and_output(volatile struct SharedMem *const sha
 // TODO: global /nonstatic for tests
 uint32_t get_input_efficiency_n8(const uint32_t voltage_uV, const uint32_t current_nA)
 {
-    uint8_t pos_v = voltage_uV >> cfg->LUT_input_V_min_log2_uV; // V-Scale is Linear!
-    uint8_t pos_c = log2safe(current_nA >> cfg->LUT_input_I_min_log2_nA);
+    uint8_t pos_v = voltage_uV >> CNV_CFG.LUT_input_V_min_log2_uV; // V-Scale is Linear!
+    uint8_t pos_c = log2safe(current_nA >> CNV_CFG.LUT_input_I_min_log2_nA);
     if (pos_v >= LUT_SIZE) pos_v = LUT_SIZE - 1;
     if (pos_c >= LUT_SIZE) pos_c = LUT_SIZE - 1;
     /* TODO: could interpolate here between 4 values, if there is time for overhead */
-    return (uint32_t) cfg->LUT_inp_efficiency_n8[pos_v][pos_c];
+    return (uint32_t) CNV_CFG.LUT_inp_efficiency_n8[pos_v][pos_c];
 }
 
 uint32_t get_output_inv_efficiency_n4(const uint32_t current_nA)
 {
-    uint8_t pos_c = log2safe(current_nA >> cfg->LUT_output_I_min_log2_nA);
+    uint8_t pos_c = log2safe(current_nA >> CNV_CFG.LUT_output_I_min_log2_nA);
     if (pos_c >= LUT_SIZE) pos_c = LUT_SIZE - 1u;
     /* TODO: could interpolate here between 2 values, if there is space for overhead */
-    return cfg->LUT_out_inv_efficiency_n4[pos_c];
+    return CNV_CFG.LUT_out_inv_efficiency_n4[pos_c];
 }
 
 void set_P_input_fW(const uint32_t P_fW) { state.P_inp_fW_n8 = ((uint64_t) P_fW) << 8u; }
@@ -403,8 +406,8 @@ bool_ft get_state_log_intermediate(void) { return state.enable_log_mid; }
 
 #endif // EMU_SUPPORT
 
-void set_batok_pin(volatile struct SharedMem *const shared_mem, const bool_ft value)
+void set_batok_pin(const bool_ft value)
 {
-    shared_mem->vsource_batok_pin_value        = value;
-    shared_mem->vsource_batok_trigger_for_pru1 = true;
+    SHARED_MEM.vsource_batok_pin_value        = value;
+    SHARED_MEM.vsource_batok_trigger_for_pru1 = true;
 }

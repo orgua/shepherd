@@ -218,7 +218,7 @@ def update_power_state_emulator() -> None:
 
 
 def set_power_state_recoder(sender, en_state, user_data) -> None:
-    shepherd_io.set_power_recorder(en_state)
+    shepherd_io.set_power_harvester(en_state)
 
 
 def update_power_state_recorder() -> None:

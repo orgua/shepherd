@@ -11,7 +11,6 @@ from shepherd_core.data_models.task import HarvestTask
 from tqdm import tqdm
 from typing_extensions import Self
 
-from . import sysfs_interface
 from .eeprom import retrieve_calibration
 from .h5_writer import Writer
 from .logger import get_verbosity
@@ -55,11 +54,6 @@ class ShepherdHarvester(ShepherdIO):
         else:
             self.start_time = cfg.time_start.timestamp()
 
-        self.samples_per_buffer = sysfs_interface.get_samples_per_buffer()
-        self.samplerate_sps = (
-            10**9 * self.samples_per_buffer // sysfs_interface.get_buffer_period_ns()
-        )
-
         self.hrv_pru = HarvesterPRUConfig.from_vhrv(
             data=cfg.virtual_harvester,
             for_emu=False,
@@ -81,15 +75,11 @@ class ShepherdHarvester(ShepherdIO):
             cal_data=self.cal_hrv,
             compression=cfg.output_compression,
             force_overwrite=cfg.force_overwrite,
-            samples_per_buffer=self.samples_per_buffer,
-            samplerate_sps=self.samplerate_sps,
             verbose=get_verbosity(),
         )
 
     def __enter__(self) -> Self:
         super().__enter__()
-        super().set_power_emulator(state=False)
-        super().set_power_recorder(state=True)
 
         super().send_virtual_harvester_settings(self.hrv_pru)
         super().send_calibration_settings(self.cal_hrv)
@@ -100,14 +90,12 @@ class ShepherdHarvester(ShepherdIO):
         # add hostname to file
         self.writer.store_hostname(platform.node().strip())
         self.writer.store_config(self.cfg.model_dump())
-        self.writer.start_monitors(self.cfg.sys_logging)
+        self.writer.start_monitors(
+            sys=self.cfg.sys_logging,
+        )
 
         # Give the PRU empty buffers to begin with
         time.sleep(1)
-        for i in range(self.n_buffers):
-            self.return_buffer(i, verbose=False)
-            time.sleep(0.1 * float(self.buffer_period_ns) / 1e9)
-            # ⤷ could be as low as ~ 10us
         return self
 
     def __exit__(
@@ -117,24 +105,8 @@ class ShepherdHarvester(ShepherdIO):
         tb: TracebackType | None = None,
         extra_arg: int = 0,
     ) -> None:
-        super()._power_down_shp()
         self.stack.close()
         super().__exit__()
-
-    def return_buffer(self, index: int, *, verbose: bool = False) -> None:
-        """Returns a buffer to the PRU
-
-        After reading the content of a buffer and potentially filling it with
-        emulation data, we have to release the buffer to the PRU to avoid it
-        running out of buffers.
-
-        :param index: (int) Index of the buffer. 0 <= index < n_buffers
-        :param verbose: chatter-prevention, performance-critical computation saver
-        """
-        self.shared_mem.clear_buffer(index)
-        super()._return_buffer(index)
-        if verbose:
-            log.debug("Sent empty buffer #%s to PRU", index)
 
     def run(self) -> None:
         success = self.start(self.start_time, wait_blocking=False)
@@ -142,7 +114,8 @@ class ShepherdHarvester(ShepherdIO):
             return
         log.info("waiting %.2f s until start", self.start_time - time.time())
         self.wait_for_start(self.start_time - time.time() + 15)
-        log.info("shepherd started!")
+        self.handle_pru_messages()
+        log.info("shepherd started! T_sys = %f", time.time())
 
         if self.cfg.duration is None:
             ts_end = sys.float_info.max
@@ -152,8 +125,7 @@ class ShepherdHarvester(ShepherdIO):
             ts_end = self.start_time + duration_s
             log.debug("Duration = %s (forced runtime)", duration_s)
 
-        # Heartbeat-Message
-        buffer_period_s = self.samples_per_buffer / self.samplerate_sps
+        # Progress-Bar
         prog_bar = tqdm(
             total=duration_s,
             desc="Measurement",
@@ -162,24 +134,34 @@ class ShepherdHarvester(ShepherdIO):
             leave=False,
         )
 
+        ts_data_last = self.start_time
         while True:
-            idx, hrv_buf = self.get_buffer(verbose=self.verbose_extra)
-            ts_now = hrv_buf.timestamp_ns / 1e9
-            # TODO: here was a bogus handling of forgivable errors, self.cfg.abort_on_error
+            data_iv = self.shared_mem.read_buffer_iv(verbose=self.verbose_extra)
+            data_ut = self.shared_mem.read_buffer_util(verbose=self.verbose_extra)
+            if data_ut:
+                self.writer.write_util_buffer(data_ut)
 
-            if ts_now >= ts_end:
-                log.debug("FINISHED! Out of bound timestamp collected -> begin to exit now")
-                break
-            prog_bar.update(n=buffer_period_s)
-
-            try:
-                self.writer.write_buffer(hrv_buf)
-            except OSError as _xpt:
-                log.error(
-                    "Failed to write data to HDF5-File - will STOP! error = %s",
-                    _xpt,
-                )
-                break
-            self.return_buffer(idx, verbose=self.verbose_extra)
+            if data_iv is not None:
+                prog_bar.update(n=data_iv.duration())
+                if data_iv.timestamp() >= ts_end:
+                    log.debug("FINISHED! Out of bound timestamp collected -> begin to exit now")
+                    break
+                ts_data_last = time.time()
+                try:
+                    self.writer.write_iv_buffer(data_iv)
+                except OSError as _xpt:
+                    log.error(
+                        "Failed to write data to HDF5-File - will STOP! error = %s",
+                        _xpt,
+                    )
+                    break
+            # TODO: implement cleaner exit from pru-statechange or end-TS
+            self.handle_pru_messages()
+            if not (data_iv or data_ut):
+                if ts_data_last - time.time() > 10:
+                    log.error("Main sheep-routine ran dry for 10s, will STOP")
+                    break
+                # rest of loop is non-blocking, so we better doze a while if nothing to do
+                time.sleep(self.segment_period_s)
 
         prog_bar.close()

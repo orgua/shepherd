@@ -10,7 +10,7 @@ from shepherd_core import CalibrationHarvester
 from shepherd_core import CalibrationSeries
 from shepherd_core import Reader as CoreReader
 from shepherd_sheep import Writer
-from shepherd_sheep.shared_memory import DataBuffer
+from shepherd_sheep.shared_memory import IVTrace
 
 
 def random_data(length: int) -> np.ndarray:
@@ -19,11 +19,11 @@ def random_data(length: int) -> np.ndarray:
 
 
 @pytest.fixture
-def data_buffer() -> DataBuffer:
+def data_buffer() -> IVTrace:
     len_ = 10_000
     voltage = random_data(len_)
     current = random_data(len_)
-    return DataBuffer(voltage, current, 1551848387472)
+    return IVTrace(voltage, current, 1551848387472)
 
 
 @pytest.fixture
@@ -33,8 +33,8 @@ def data_h5(tmp_path: Path) -> Path:
         store.store_hostname("Pinky")
         for i in range(100):
             len_ = 10_000
-            mock_data = DataBuffer(random_data(len_), random_data(len_), i)
-            store.write_buffer(mock_data)
+            mock_data = IVTrace(random_data(len_), random_data(len_), i)
+            store.write_iv_buffer(mock_data)
     return name
 
 
@@ -78,12 +78,12 @@ def test_create_h5writer_with_force(tmp_path: Path, cal_cape: CalibrationCape) -
 def test_h5writer_data(
     mode: str,
     tmp_path: Path,
-    data_buffer: DataBuffer,
+    data_buffer: IVTrace,
     cal_cape: CalibrationCape,
 ) -> None:
     d = tmp_path / "harvest.h5"
     with Writer(file_path=d, cal_data=cal_cape.harvester, mode=mode) as log:
-        log.write_buffer(data_buffer)
+        log.write_iv_buffer(data_buffer)
 
     with h5py.File(d, "r") as written:
         assert "data" in written
@@ -131,7 +131,7 @@ def test_key_value_store(tmp_path: Path, cal_cape: CalibrationCape) -> None:
 @pytest.mark.timeout(2)
 def test_h5writer_performance(
     tmp_path: Path,
-    data_buffer: DataBuffer,
+    data_buffer: IVTrace,
     cal_cape: CalibrationCape,
 ) -> None:
     d = tmp_path / "harvest_perf.h5"
@@ -140,7 +140,7 @@ def test_h5writer_performance(
         force_overwrite=True,
         cal_data=cal_cape.harvester,
     ) as log:
-        log.write_buffer(data_buffer)
+        log.write_iv_buffer(data_buffer)
 
 
 def test_reader_performance(data_h5: Path) -> None:

@@ -92,23 +92,20 @@ void msg_sys_reset(void)
 
 void msg_sys_test(void)
 {
-    struct ProtoMsg msg1 = {.id       = MSG_TO_PRU,
-                            .unread   = 0u,
-                            .type     = MSG_NONE,
-                            .reserved = {0u},
-                            .value    = {0u, 0u}};
-    struct SyncMsg  msg2;
+    struct ProtoMsg msg = {.id       = MSG_TO_PRU,
+                           .unread   = 0u,
+                           .type     = MSG_NONE,
+                           .reserved = {0u},
+                           .value    = {0u, 0u}};
     printk(KERN_INFO "shprd.k: test msg-pipelines between kM and PRUs -> triggering "
                      "roundtrip-messages for pipeline 1-3");
-    msg1.type     = MSG_TEST_ROUTINE;
-    msg1.value[0] = 1;
-    put_msg_to_pru(&msg1); // message-pipeline pru0
-    msg1.value[0] = 2;
-    put_msg_to_pru(&msg1); // error-pipeline pru0
-
-    msg2.type                = MSG_TEST_ROUTINE;
-    msg2.buffer_block_period = 3;
-    pru1_comm_send_sync_reply(&msg2); // error-pipeline pru1
+    msg.type     = MSG_TEST_ROUTINE;
+    msg.value[0] = 1;
+    put_msg_to_pru(&msg); // message-pipeline pru0
+    msg.value[0] = 2;
+    put_msg_to_pru(&msg); // error-pipeline pru0
+    msg.value[0] = 3;
+    pru1_comm_send_sync_reply(&msg); // error-pipeline pru1
 }
 
 void msg_sys_init(void)
@@ -171,17 +168,18 @@ void msg_sys_start(void)
 
 static enum hrtimer_restart coordinator_callback(struct hrtimer *timer_for_restart)
 {
-    struct ProtoMsg     pru_msg;
-    static unsigned int step_pos = 0;
-    uint8_t             had_work;
-    uint32_t            iter;
+    struct ProtoMsg pru_msg;
+    static uint32_t step_pos       = 0;
+    static uint32_t canary_counter = 100000;
+    uint8_t         had_work;
+    uint32_t        iter;
 
     /* Timestamp system clock */
-    const ktime_t       ts_now_kt = ktime_get_real();
+    const ktime_t   ts_now_kt = ktime_get_real();
 
     if (!timers_active) return HRTIMER_NORESTART;
 
-    for (iter = 0; iter < 6; ++iter) /* 3 should be enough, 6 has safety-margin included */
+    for (iter = 0; iter < 4; ++iter) /* 3 should be enough, 6 has safety-margin included */
     {
         if (pru0_comm_receive_msg(&pru_msg)) had_work = 2;
         else if (pru0_comm_receive_error(&pru_msg)) had_work = 4;
@@ -203,11 +201,11 @@ static enum hrtimer_restart coordinator_callback(struct hrtimer *timer_for_resta
             switch (pru_msg.type)
             {
                 // NOTE: all MSG_ERR also get handed to python
-                case MSG_ERROR:
-                    printk(KERN_ERR "shprd.pru%u: general error (val=%u)", had_work & 1u,
-                           pru_msg.value[0]);
+                case MSG_ERR_INVLD_CMD:
+                    printk(KERN_ERR "shprd.pru%u: pru received invalid cmd, type = %u",
+                           had_work & 1u, pru_msg.value[0]);
                     break;
-                case MSG_ERR_MEMCORRUPTION:
+                case MSG_ERR_MEM_CORRUPTION:
                     printk(KERN_ERR "shprd.pru%u: msg.id from kernel is faulty -> mem "
                                     "corruption? (val=%u)",
                            had_work & 1u, pru_msg.value[0]);
@@ -217,13 +215,13 @@ static enum hrtimer_restart coordinator_callback(struct hrtimer *timer_for_resta
                                     "-> backpressure (val=%u)",
                            had_work & 1u, pru_msg.value[0]);
                     break;
-                case MSG_ERR_INCMPLT:
-                case MSG_ERR_INVLDCMD:
-                case MSG_ERR_NOFREEBUF: break;
-
                 case MSG_ERR_TIMESTAMP:
                     printk(KERN_ERR "shprd.pru%u: received timestamp is faulty (val=%u)",
                            had_work & 1u, pru_msg.value[0]);
+                    break;
+                case MSG_ERR_CANARY:
+                    printk(KERN_ERR "shprd.pru%u: detected a dead canary (val=%u)", had_work & 1u,
+                           pru_msg.value[0]);
                     break;
                 case MSG_ERR_SYNC_STATE_NOT_IDLE:
                     printk(KERN_ERR "shprd.pru%u: Sync not idle at host interrupt (val=%u)",
@@ -233,7 +231,13 @@ static enum hrtimer_restart coordinator_callback(struct hrtimer *timer_for_resta
                     printk(KERN_ERR "shprd.pru%u: content of msg failed test (val=%u)",
                            had_work & 1u, pru_msg.value[0]);
                     break;
-
+                case MSG_ERR_ADC_NOT_FOUND:
+                    printk(KERN_ERR "shprd.pru%u: failed to read back from ADC -> is cape powered? "
+                                    "(pin=%u, value=%u)",
+                           had_work & 1u, pru_msg.value[0], pru_msg.value[1]);
+                    break;
+                case MSG_ERR_SAMPLE_MODE: break;
+                case MSG_ERR_HRV_ALGO: break;
                 case MSG_STATUS_RESTARTING_ROUTINE:
                     printk(KERN_INFO "shprd.pru%u: (re)starting main-routine", had_work & 1u);
                     break;
@@ -244,22 +248,37 @@ static enum hrtimer_restart coordinator_callback(struct hrtimer *timer_for_resta
                     break;
                 default:
                     /* these are all handled in userspace and will be passed by sys-fs */
-                    printk(KERN_ERR "shprd.k: received invalid command / msg-type (0x%02X) "
+                    printk(KERN_ERR "shprd.k: received invalid command / msg-type = 0x%02X "
                                     "from pru%u",
                            pru_msg.type, had_work & 1u);
             }
         }
 
         /* resetting to the shortest sleep period */
-        step_pos = coord_timer_steps_ns_size - 1;
+        step_pos = coord_timer_steps_ns_size - 1u;
     }
 
     if (pru0_comm_check_send_status() && ring_get(&msg_ringbuf_to_pru, &pru_msg))
     {
         pru0_comm_send_msg(&pru_msg);
         /* resetting to the shortest sleep period */
-        step_pos = coord_timer_steps_ns_size - 1;
+        step_pos = coord_timer_steps_ns_size - 1u;
     }
+
+    if (canary_counter++ > 100000u)
+    {
+        canary_counter   = 0u;
+        pru_msg.value[0] = mem_interface_check_canaries();
+        if (pru_msg.value[0] > 0u)
+        {
+            pru_msg.id     = MSG_TO_USER;
+            pru_msg.type   = MSG_ERR_CANARY;
+            pru_msg.canary = CANARY_VALUE_U32;
+            ring_put(&msg_ringbuf_from_pru, &pru_msg);
+        }
+        else printk(KERN_INFO "shprd.k: verified canaries");
+    }
+
     /* variable sleep cycle */
     hrtimer_forward(timer_for_restart, ts_now_kt, ns_to_ktime(coord_timer_steps_ns[step_pos]));
 

@@ -3,16 +3,9 @@
 
 #include "commons.h"
 
-void sample_init(const volatile struct SharedMem *shared_mem);
+void     sample_init();
 
-#ifdef EMU_SUPPORT
-void sample(volatile struct SharedMem *const shared_mem,
-            struct SampleBuffer *const current_buffer_far, const enum ShepherdMode mode);
-#else
-void sample(const volatile struct SharedMem *const shared_mem,
-            struct SampleBuffer *const current_buffer_far, const enum ShepherdMode mode);
-#endif
-
+void     sample();
 
 uint32_t sample_dbg_adc(uint32_t channel_num);
 void     sample_dbg_dac(uint32_t value);

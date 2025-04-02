@@ -51,6 +51,7 @@ def simulate_source(
         dtype_in=file_inp.get_datatype(),
         log_intermediate=False,
         window_size=file_inp.get_window_samples(),
+        voltage_step_V=file_inp.get_voltage_step(),
     )
     i_out_nA = 0
     e_out_Ws = 0.0

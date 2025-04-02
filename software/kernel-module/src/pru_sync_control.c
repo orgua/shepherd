@@ -1,50 +1,53 @@
+#include <asm/io.h> /* gpio0-access */
+#include <linux/delay.h>
 #include <linux/hrtimer.h>
 #include <linux/ktime.h>
 #include <linux/math64.h>
-#include <linux/slab.h>
+#include <linux/slab.h> /* kmalloc */
 
+#include "_shepherd_config.h"
 #include "pru_mem_interface.h"
 #include "pru_sync_control.h"
 
-static uint32_t             sys_ts_over_timer_wrap_ns = 0;
-static uint64_t             ts_upcoming_ns            = 0;
-static uint64_t             ts_previous_ns            = 0; /* for plausibility-check */
+#define U32T_MAX (0xFFFFFFFFu)
+static uint32_t             sys_ts_over_wrap_ns = U32T_MAX;
+static uint64_t             ts_upcoming_ns      = 0;
+static uint64_t             ts_previous_ns      = 0; /* for plausibility-check */
 
 static enum hrtimer_restart trigger_loop_callback(struct hrtimer *timer_for_restart);
 static enum hrtimer_restart sync_loop_callback(struct hrtimer *timer_for_restart);
-static uint32_t       trigger_loop_period_ns = 100000000u; /* just initial value to avoid div0 */
-
-/*
-* add pre-trigger, because design previously aimed directly for busy pru_timer_wrap
-* (50% chance that pru takes a less meaningful counter-reading after wrap)
-* 1 ms + 5 us, this should be enough time for the ping-pong-messaging to complete before timer_wrap
-*/
-static const uint32_t ns_pre_trigger         = 1005000u;
 
 /* Timer to trigger fast sync_loop */
-struct hrtimer        trigger_loop_timer;
-struct hrtimer        sync_loop_timer;
-static u8             timers_active        = 0u;
+struct hrtimer              trigger_loop_timer;
+struct hrtimer              sync_loop_timer;
+static u8                   timers_active = 0u;
+
+/* debug gpio - gpio0[22] - P8_19 - BUTTON_LED is suitable */
+static void __iomem        *gpio0set      = NULL;
+static void __iomem        *gpio0clear    = NULL;
+#define GPIO_P819_SET iowrite32(0b1u << 22u, gpio0set);
+#define GPIO_P819_CLR iowrite32(0b1u << 22u, gpio0clear);
 
 /* series of halving sleep cycles, sleep less coming slowly near a total of 100ms of sleep */
-static const unsigned int timer_steps_ns[] = {20000000u, 20000000u, 20000000u, 20000000u, 10000000u,
+static const unsigned int TIMER_STEPS_NS[] = {20000000u, 20000000u, 20000000u, 20000000u, 10000000u,
                                               5000000u,  2000000u,  1000000u,  500000u,   200000u,
                                               100000u,   50000u,    20000u};
 /* TODO: sleep 100ms - 20 us
 * TODO: above halvings sum up to 98870 us */
-static const size_t       timer_steps_ns_size = sizeof(timer_steps_ns) / sizeof(timer_steps_ns[0]);
+static const size_t       TIMER_STEPS_NS_SIZE = sizeof(TIMER_STEPS_NS) / sizeof(TIMER_STEPS_NS[0]);
 //static unsigned int step_pos = 0;
 
-// Sync-Routine - TODO: take these from pru-sharedmem
-#define BUFFER_PERIOD_NS       (100000000U) // TODO: there is already: trigger_loop_period_ns
-#define ADC_SAMPLES_PER_BUFFER (10000U)
-#define TIMER_TICK_NS          (5U)
-#define TIMER_BASE_PERIOD      (BUFFER_PERIOD_NS / TIMER_TICK_NS)
-#define SAMPLE_INTERVAL_NS     (BUFFER_PERIOD_NS / ADC_SAMPLES_PER_BUFFER)
-#define SAMPLE_PERIOD          (TIMER_BASE_PERIOD / ADC_SAMPLES_PER_BUFFER)
-static uint32_t     info_count = 6666; /* >6k triggers explanation-message once */
-struct sync_data_s *sync_data  = NULL;
-static u8           init_done  = 0;
+static uint32_t           info_count          = 6666; /* >6k triggers explanation-message once */
+struct sync_data_s        sync_state;
+static u8                 init_done       = 0;
+
+/* PI-Tuning
+ * - float is hard to use in kernel 4.19, so i32 it is ...
+ * - Ki already includes 0.1 s sample_interval
+ * - values are inverted (inv) and shifted by 10 bit (n10)
+ */
+const int32_t             kp_inv_n10_init = 1024 / 1.1;
+const int32_t             ki_inv_n10_init = 1024 / (0.9 * 0.1); //
 
 /* Benchmark high-res busy-wait - RESULTS:
  * - ktime_get                  99.6us   215n   463ns/call
@@ -56,41 +59,39 @@ static u8           init_done  = 0;
  * - increment-loop             825us    100k   8.25ns/iteration
  */
 
-void                sync_exit(void)
+void                      sync_exit(void)
 {
     hrtimer_cancel(&trigger_loop_timer);
     hrtimer_cancel(&sync_loop_timer);
-    if (sync_data != NULL)
+    if (gpio0clear != NULL)
     {
-        kfree(sync_data);
-        sync_data = NULL;
+        iounmap(gpio0clear);
+        gpio0clear = NULL;
+    }
+    if (gpio0set != NULL)
+    {
+        iounmap(gpio0set);
+        gpio0set = NULL;
     }
     init_done = 0;
-    printk(KERN_INFO "shprd.k: pru-sync-system exited");
+    printk(KERN_INFO "shprd.sync: pru-sync-system exited");
 }
 
-int sync_init(uint32_t timer_period_ns)
+int sync_init(void)
 {
     uint32_t ret_value;
 
     if (init_done)
     {
-        printk(KERN_ERR "shprd.k: pru-sync-system init requested -> can't init twice!");
+        printk(KERN_ERR "shprd.sync: pru-sync-system init requested -> can't init twice!");
         return -1;
-    }
-
-    sync_data = kmalloc(sizeof(struct sync_data_s), GFP_KERNEL);
-    if (!sync_data)
-    {
-        printk(KERN_ERR "shprd.k: pru-sync-system kmalloc failed!");
-        return -2;
     }
     sync_reset();
 
-    /* timer for trigger, TODO: this needs better naming, make clear what it does */
-    trigger_loop_period_ns = timer_period_ns; /* should be 100 ms */
-    //printk(KERN_INFO "shprd.k: new timer_period_ns = %u", trigger_loop_period_ns);
+    gpio0clear = ioremap(0x44E07000 + 0x190, 4); // BBB, GPIO0
+    gpio0set   = ioremap(0x44E07000 + 0x194, 4);
 
+    /* timer for trigger */
     hrtimer_init(&trigger_loop_timer, CLOCK_REALTIME, HRTIMER_MODE_ABS);
     // TODO: HRTIMER_MODE_ABS_HARD wanted, but _HARD not defined in 4.19 (without -RT)
     trigger_loop_timer.function = &trigger_loop_callback;
@@ -100,18 +101,18 @@ int sync_init(uint32_t timer_period_ns)
     sync_loop_timer.function = &sync_loop_callback;
 
     init_done                = 1;
-    printk(KERN_INFO "shprd.k: pru-sync-system initialized (wanted: hres, abs, hard)");
+    printk(KERN_INFO "shprd.sync: pru-sync-system initialized (wanted: hres, abs, hard)");
 
     ret_value = hrtimer_is_hres_active(&trigger_loop_timer);
-    printk("%sshprd.k: trigger_hrtimer.hres    = %d", ret_value == 1 ? KERN_INFO : KERN_ERR,
+    printk("%sshprd.sync: trigger_hrtimer.hres    = %d", ret_value == 1 ? KERN_INFO : KERN_ERR,
            ret_value);
     ret_value = trigger_loop_timer.is_rel;
-    printk("%sshprd.k: trigger_hrtimer.is_rel  = %d", ret_value == 0 ? KERN_INFO : KERN_ERR,
+    printk("%sshprd.sync: trigger_hrtimer.is_rel  = %d", ret_value == 0 ? KERN_INFO : KERN_ERR,
            ret_value);
     ret_value = trigger_loop_timer.is_soft;
-    printk("%sshprd.k: trigger_hrtimer.is_soft = %d", ret_value == 0 ? KERN_INFO : KERN_ERR,
+    printk("%sshprd.sync: trigger_hrtimer.is_soft = %d", ret_value == 0 ? KERN_INFO : KERN_ERR,
            ret_value);
-    //printk(KERN_INFO "shprd.k: trigger_hrtimer.is_hard = %d", trigger_loop_timer.is_hard); // needs kernel 5.4+
+    //printk(KERN_INFO "shprd.sync: trigger_hrtimer.is_hard = %d", trigger_loop_timer.is_hard); // needs kernel 5.4+
     sync_start();
     return 0;
 }
@@ -120,11 +121,11 @@ void sync_pause(void)
 {
     if (!timers_active)
     {
-        printk(KERN_ERR "shprd.k: pru-sync-system pause requested -> but wasn't running!");
+        printk(KERN_ERR "shprd.sync: pru-sync-system pause requested -> but wasn't running!");
         return;
     }
     timers_active = 0;
-    printk(KERN_INFO "shprd.k: pru-sync-system paused");
+    printk(KERN_INFO "shprd.sync: pru-sync-system paused");
 }
 
 void sync_start(void)
@@ -136,84 +137,91 @@ void sync_start(void)
 
     if (!init_done)
     {
-        printk(KERN_ERR "shprd.k: pru-sync-system start requested without prior init!");
+        printk(KERN_ERR "shprd.sync: pru-sync-system start requested without prior init!");
         return;
     }
     if (timers_active)
     {
-        printk(KERN_ERR "shprd.k: pru-sync-system start requested -> but already running!");
+        printk(KERN_ERR "shprd.sync: pru-sync-system start requested -> but already running!");
         return;
     }
 
     sync_reset();
 
-    div_u64_rem(ts_now_ns, trigger_loop_period_ns, &ns_over_wrap);
-    if (ns_over_wrap > (trigger_loop_period_ns / 2))
-    {
-        /* target timer-wrap one ahead */
-        ns_to_next_trigger = 2 * trigger_loop_period_ns - ns_over_wrap - ns_pre_trigger;
-    }
-    else
-    {
-        /* target next timer-wrap */
-        ns_to_next_trigger = trigger_loop_period_ns - ns_over_wrap - ns_pre_trigger;
-    }
-
-    hrtimer_start(&trigger_loop_timer, ns_to_ktime(ts_now_ns + ns_to_next_trigger),
-                  HRTIMER_MODE_ABS); // was: HRTIMER_MODE_ABS_HARD for -rt Kernel
+    div_u64_rem(ts_now_ns, SYNC_INTERVAL_NS, &ns_over_wrap);
+    if (ns_over_wrap > (SYNC_INTERVAL_NS / 2))
+        ns_to_next_trigger = 2 * SYNC_INTERVAL_NS - ns_over_wrap;
+    else ns_to_next_trigger = SYNC_INTERVAL_NS - ns_over_wrap;
 
     hrtimer_start(&sync_loop_timer, ns_to_ktime(ts_now_ns + 1000000u), HRTIMER_MODE_ABS);
-    printk(KERN_INFO "shprd.k: pru-sync-system started");
+    printk(KERN_INFO "shprd.sync: pru-sync-system started");
     timers_active = 1;
 }
 
 void sync_reset(void)
 {
-    sync_data->error_now       = 0;
-    sync_data->error_pre       = 0;
-    sync_data->error_dif       = 0;
-    sync_data->error_sum       = 0;
-    sync_data->clock_corr      = 0;
-    sync_data->previous_period = TIMER_BASE_PERIOD;
+    sync_state.output_sum   = 0;
+    sync_state.input_smooth = 20000000;
+    sync_state.k_state      = 0;
+    sync_state.kp_inv_n10   = kp_inv_n10_init;
+    sync_state.ki_inv_n10   = ki_inv_n10_init;
 }
+
+void trigger_loop_start(void)
+{
+    struct ProtoMsg64 sync_reply64;
+    const uint64_t    ts_now_ns = ktime_get_real_ns();
+
+    // initial hard reset of timestamp on PRU on 0.1s - grid
+    div_u64_rem(ts_now_ns, SYNC_INTERVAL_NS, &sys_ts_over_wrap_ns);
+    ts_upcoming_ns     = ts_now_ns + SYNC_INTERVAL_NS - sys_ts_over_wrap_ns;
+
+    sync_reply64.type  = MSG_SYNC_RESET;
+    sync_reply64.value = ts_upcoming_ns;
+    pru1_comm_send_sync_reply((struct ProtoMsg *) &sync_reply64);
+
+    if (sys_ts_over_wrap_ns > 1000u) ndelay(sys_ts_over_wrap_ns - 1000u);
+    mem_interface_trigger(HOST_PRU_EVT_TIMESTAMP);
+
+    ts_previous_ns = 0;
+    ts_upcoming_ns += SYNC_INTERVAL_NS;
+    sys_ts_over_wrap_ns = 0;
+    hrtimer_start(&trigger_loop_timer, ns_to_ktime(ts_upcoming_ns),
+                  HRTIMER_MODE_ABS); // was: HRTIMER_MODE_ABS_HARD for -rt Kernel
+
+    printk(KERN_WARNING "shprd.sync: pru1-init with reset of time to %llu - starting loop",
+           ts_upcoming_ns);
+}
+
 
 enum hrtimer_restart trigger_loop_callback(struct hrtimer *timer_for_restart)
 {
     uint64_t ns_to_next_trigger;
     uint64_t ts_now_ns;
+    // TODO: best would be to get rid of this additional loop - is there a sys-interrupt we can use?
+    GPIO_P819_SET;
 
     /* Raise Interrupt on PRU, telling it to timestamp IEP */
     mem_interface_trigger(HOST_PRU_EVT_TIMESTAMP);
 
     /* Timestamp system clock */
     ts_now_ns = ktime_get_real_ns();
+    GPIO_P819_CLR;
 
     if (!timers_active) return HRTIMER_NORESTART;
     /*
      * Get distance of system clock from timer wrap.
      * Is negative, when interrupt happened before wrap, positive when after
      */
-    div_u64_rem(ts_now_ns, trigger_loop_period_ns, &sys_ts_over_timer_wrap_ns);
-    ts_upcoming_ns = ts_now_ns + trigger_loop_period_ns - sys_ts_over_timer_wrap_ns;
-    // TODO: test! was 'ts_upcoming_ns += trigger_loop_period_ns' before
+    div_u64_rem(ts_now_ns, SYNC_INTERVAL_NS, &sys_ts_over_wrap_ns);
 
-    if (sys_ts_over_timer_wrap_ns > (trigger_loop_period_ns / 2))
-    {
-        /* normal use case (with pre-trigger) */
-        /* self regulating formula that results in ~ trigger_loop_period_ns */
-        ns_to_next_trigger =
-                2 * trigger_loop_period_ns - sys_ts_over_timer_wrap_ns - ns_pre_trigger;
-    }
-    else
-    {
-        printk(KERN_ERR "shprd.k: module missed a sync-trigger! -> last timestamp is "
-                        "now probably used twice by PRU");
-        ns_to_next_trigger = trigger_loop_period_ns - sys_ts_over_timer_wrap_ns - ns_pre_trigger;
-        sys_ts_over_timer_wrap_ns = 0u; /* invalidate this measurement */
-    }
-    // TODO: minor optimization
-    //  - write ts_upcoming_ns directly into shared mem, as well as the other values in sync_loop
-    //  - the reply-message is not needed anymore (current pru-code has nothing to calculate beforehand and would just use prev values if no new message arrives
+    if (sys_ts_over_wrap_ns > (SYNC_INTERVAL_NS / 2))
+        ns_to_next_trigger = 2 * SYNC_INTERVAL_NS - sys_ts_over_wrap_ns;
+    else ns_to_next_trigger = SYNC_INTERVAL_NS - sys_ts_over_wrap_ns;
+    ts_upcoming_ns = ts_now_ns + ns_to_next_trigger;
+
+    // printk(KERN_INFO "shprd.sync: triggered @%llu, next ts = %llu", ts_now_ns, ts_upcoming_ns);
+    // NOTE: without load this trigger is accurate < 4 us
 
     hrtimer_forward(timer_for_restart, ns_to_ktime(ts_now_ns), ns_to_ktime(ns_to_next_trigger));
 
@@ -224,7 +232,8 @@ enum hrtimer_restart trigger_loop_callback(struct hrtimer *timer_for_restart)
 enum hrtimer_restart sync_loop_callback(struct hrtimer *timer_for_restart)
 {
     struct ProtoMsg       sync_rqst;
-    struct SyncMsg        sync_reply;
+    struct ProtoMsg       sync_reply;
+
     static uint64_t       ts_last_error_ns = 0;
     static const uint64_t quiet_time_ns    = 10000000000; // 10 s
     static unsigned int   step_pos         = 0;
@@ -235,27 +244,41 @@ enum hrtimer_restart sync_loop_callback(struct hrtimer *timer_for_restart)
 
     if (pru1_comm_receive_sync_request(&sync_rqst))
     {
-        sync_loop(&sync_reply, &sync_rqst);
-
-        if (!pru1_comm_send_sync_reply(&sync_reply))
+        switch (sync_rqst.type)
         {
-            /* Error occurs if PRU was not able to handle previous message in time */
-            printk(KERN_WARNING "shprd.k: Send_SyncResponse -> back-pressure / did "
-                                "overwrite old msg");
-        }
+            case MSG_SYNC_ROUTINE:
+                sync_PID_correction(&sync_reply, &sync_rqst);
+                if (!pru1_comm_send_sync_reply(&sync_reply))
+                {
+                    /* Error occurs if PRU was not able to handle previous message in time */
+                    printk(KERN_WARNING "shprd.sync: Send_SyncResponse -> back-pressure / did "
+                                        "overwrite old msg");
+                }
+                /* resetting to the longest sleep period */
+                step_pos = 0;
+                break;
 
-        /* resetting to the longest sleep period */
-        step_pos = 0;
+            case MSG_SYNC_RESET:
+                trigger_loop_start();
+                /* resetting to the longest sleep period */
+                step_pos = 0;
+                break;
+
+            default:
+                /* these are all handled in userspace and will be passed by sys-fs */
+                printk(KERN_ERR "shprd.k: received invalid command / msg-type (0x%02X) from pru1",
+                       sync_rqst.type);
+        }
     }
     else if ((ts_last_error_ns + quiet_time_ns < ts_now_ns) &&
-             (ts_previous_ns + 2 * trigger_loop_period_ns < ts_now_ns) && (ts_previous_ns > 0))
+             (ts_previous_ns + 2 * SYNC_INTERVAL_NS < ts_now_ns) && (ts_previous_ns > 0))
     {
         // TODO: not working as expected, this routine should get notified when PRUs are offline
         ts_last_error_ns = ts_now_ns;
-        printk(KERN_ERR "shprd.k: Faulty behavior - PRU did not answer to "
+        printk(KERN_ERR "shprd.sync: Faulty behavior - PRU did not answer to "
                         "trigger-request in time!");
     }
-    else if ((ts_previous_ns + 2 * trigger_loop_period_ns < ts_now_ns) && (ts_previous_ns > 0))
+    else if ((ts_previous_ns + 2 * SYNC_INTERVAL_NS < ts_now_ns) && (ts_previous_ns > 0))
     {
         // try to reduce CPU-Usage (ktimersoftd/0 has 50%) when PRUs are halting during operation
         step_pos = 0;
@@ -263,117 +286,127 @@ enum hrtimer_restart sync_loop_callback(struct hrtimer *timer_for_restart)
 
     /* variable sleep cycle */
     hrtimer_forward(timer_for_restart, ns_to_ktime(ts_now_ns),
-                    ns_to_ktime(timer_steps_ns[step_pos]));
+                    ns_to_ktime(TIMER_STEPS_NS[step_pos]));
 
-    if (step_pos < timer_steps_ns_size - 1) step_pos++;
+    if (step_pos < TIMER_STEPS_NS_SIZE - 1u) step_pos++;
 
     return HRTIMER_RESTART;
 }
 
 
-int sync_loop(struct SyncMsg *const sync_reply, const struct ProtoMsg *const sync_rqst)
+int sync_PID_correction(struct ProtoMsg *const sync_reply, const struct ProtoMsg *const sync_rqst)
 {
-    uint32_t iep_ts_over_timer_wrap_ns;
-    uint64_t ns_per_tick_n30; /* n30 means a fixed point shift left by 30 bits */
+    const int32_t sum_limit     = 10000000;
+    const int32_t out_limit     = 200000; // max 1ms correction per 0.1s
+    const int32_t smooth_factor = 5;
+    /* temporary vars */
+    uint32_t      pru_ts_over_wrap_ns;
+    int32_t       input_now;
+    int64_t       error, output;
+    int32_t       correction_sample, correction_floor;
 
-    /*
-     * Based on the previous IEP timer period and the nominal timer period
-     * we can estimate the real nanoseconds passing per tick
-     * We operate on fixed point arithmetic OPs by shifting by 30 bit
-     */
-    ns_per_tick_n30 =
-            div_u64(((uint64_t) trigger_loop_period_ns << 30u), sync_data->previous_period);
+    /* Get distance of IEP clock at interrupt from last timer wrap
+     * if sys_wrap is invalid -> (also) invalidate this measurement */
+    pru_ts_over_wrap_ns = sync_rqst->value[0];
+    if (sys_ts_over_wrap_ns == U32T_MAX) pru_ts_over_wrap_ns = U32T_MAX;
 
-    /* Get distance of IEP clock at interrupt from last timer wrap */
-    if (sys_ts_over_timer_wrap_ns > 0u)
-    {
-        iep_ts_over_timer_wrap_ns =
-                (uint32_t) ((((uint64_t) sync_rqst->value[0]) * ns_per_tick_n30) >> 30u);
-    }
+    /* calculate PID-Input */
+    input_now = (int32_t) pru_ts_over_wrap_ns - (int32_t) sys_ts_over_wrap_ns;
+
+    /* center values around Zero */
+    if (input_now < -(int32_t) (SYNC_INTERVAL_NS / 2)) input_now += SYNC_INTERVAL_NS;
+    else if (input_now > (int32_t) (SYNC_INTERVAL_NS / 2)) input_now -= SYNC_INTERVAL_NS;
+
+    /* generate smoothed & absolute version of input */
+    if (input_now >= 0)
+        sync_state.input_smooth =
+                ((smooth_factor - 1) * sync_state.input_smooth + input_now) / smooth_factor;
     else
+        sync_state.input_smooth =
+                ((smooth_factor - 1) * sync_state.input_smooth - input_now) / smooth_factor;
+
+    /* adjust PI-Tuning once stable */
+    // TODO: slow down state-changes, also try holding ki - phase-changes stay in recent versions
+    if ((sync_state.input_smooth < 1000000) && (sync_state.k_state == 0))
     {
-        /* (also) invalidate this measurement */
-        iep_ts_over_timer_wrap_ns = 0u;
+        sync_state.kp_inv_n10 *= 2;
+        sync_state.ki_inv_n10 *= 2;
+        sync_state.k_state++;
+        printk(KERN_INFO "shprd.sync: error BELOW 1ms -> relax PI-tuning");
+    }
+    else if ((sync_state.input_smooth < 200000) && (sync_state.k_state == 1))
+    {
+        sync_state.kp_inv_n10 *= 2;
+        sync_state.ki_inv_n10 *= 2;
+        sync_state.k_state++;
+        printk(KERN_INFO "shprd.sync: error BELOW 200us -> relax PI-tuning");
+    }
+    else if ((sync_state.input_smooth > 2000000) && (sync_state.k_state > 0))
+    {
+        sync_state.kp_inv_n10 = kp_inv_n10_init;
+        sync_state.ki_inv_n10 = ki_inv_n10_init;
+        sync_state.k_state    = 0;
+        printk(KERN_ERR "shprd.sync: error ABOVE 2ms -> more responsive PI-tuning");
     }
 
-    /* Difference between system clock and IEP clock phase */
-    sync_data->error_pre = sync_data->error_now; // TODO: new D (of PID) is not in sysfs yet
-    sync_data->error_now =
-            (int64_t) iep_ts_over_timer_wrap_ns - (int64_t) sys_ts_over_timer_wrap_ns;
-    sync_data->error_dif = sync_data->error_now - sync_data->error_pre;
-    if (sync_data->error_now < -(int64_t) (trigger_loop_period_ns / 2))
+    error = -input_now;
+
+    sync_state.output_sum += div_s64(1024 * error, sync_state.ki_inv_n10);
+    if (sync_state.output_sum > +sum_limit) sync_state.output_sum = +sum_limit;
+    if (sync_state.output_sum < -sum_limit) sync_state.output_sum = -sum_limit;
+
+    output = div_s64(1024 * error, sync_state.kp_inv_n10) + sync_state.output_sum;
+    if (output > +out_limit) output = +out_limit;
+    if (output < -out_limit) output = -out_limit;
+
+    /* determine corrected slow-down / speed-up for next sync-interval
+    * NOTE: positive value[0] means PRU is AHEAD and needs to slow
+    * */
+    sync_reply->type     = MSG_SYNC_ROUTINE;
+    correction_sample    = div_s64(output, ((int32_t) SAMPLES_PER_SYNC));
+    sync_reply->value[0] = (uint32_t) (SAMPLE_INTERVAL_TICKS - correction_sample);
+    correction_floor     = ((int32_t) SAMPLES_PER_SYNC) * correction_sample;
+
+    if (output >= correction_floor) sync_reply->value[1] = (uint32_t) (output - correction_floor);
+    else sync_reply->value[1] = (uint32_t) (correction_floor - output);
+
+    if ((sync_state.input_smooth > 300) && (++info_count >= 20))
     {
-        /* Currently the correction is (almost) always headed in one direction
-         * - the pre-trigger @ - 1 ms is the "almost" (1 % chance for the other direction)
-         * - correct the imbalance to 50/50
-         */
-        sync_data->error_now += trigger_loop_period_ns;
-    }
-    sync_data->error_sum += sync_data->error_now;
-    // integral should be behind controller, because current P-value is twice in calculation
-
-    /* This is the actual PI controller equation
-     * NOTE1: unit of clock_corr in pru is ticks, but input is based on nanosec
-     * NOTE2: traces show, that quantization noise could be a problem. example: K-value of 127, divided by 128 will still be 0, ringing is around ~ +-150
-     * previous parameters were:    P=1/32, I=1/128, correction settled at ~1340 with values from 1321 to 1359
-     * current parameters:          P=1/100,I=1/300, correction settled at ~1332 with values from 1330 to 1335
-     * */
-    sync_data->clock_corr =
-            (int32_t) (div_s64(sync_data->error_now, 128) + div_s64(sync_data->error_sum, 256));
-    /* 0.4 % -> ~12s for phase lock */
-    if (sync_data->clock_corr > +80000) sync_data->clock_corr = +80000;
-    if (sync_data->clock_corr < -80000) sync_data->clock_corr = -80000;
-
-    /* determine corrected loop_ticks for next buffer_block */
-    sync_reply->type                 = MSG_SYNC_ROUTINE;
-    sync_reply->buffer_block_period  = TIMER_BASE_PERIOD + sync_data->clock_corr;
-    sync_data->previous_period       = sync_reply->buffer_block_period;
-    sync_reply->analog_sample_period = (sync_reply->buffer_block_period / ADC_SAMPLES_PER_BUFFER);
-    sync_reply->compensation_steps   = sync_reply->buffer_block_period -
-                                     (ADC_SAMPLES_PER_BUFFER * sync_reply->analog_sample_period);
-
-    if (((sync_data->error_now > 500) || (sync_data->error_now < -500)) && (++info_count >= 100))
-    {
-        /* val = 200 prints every 20s when enabled */
-        printk(KERN_INFO "shprd.sync: period=%u, n_comp=%u, er_pid=%lld/%lld/%lld, "
-                         "ns_iep=%u, ns_sys=%u",
-               sync_reply->analog_sample_period, // = upper part of buffer_block_period
-               sync_reply->compensation_steps,   // = lower part of buffer_block_period
-               sync_data->error_now, sync_data->error_sum, sync_data->error_dif,
-               iep_ts_over_timer_wrap_ns, sys_ts_over_timer_wrap_ns);
         if (info_count > 6600)
-            printk(KERN_INFO "shprd.sync: NOTE - previous message is shown every 10 s when "
-                             "sync-error exceeds a threshold (normal mainly during startup)");
+        {
+            printk(KERN_INFO "shprd.sync: NOTE - next message is shown every 2 s when "
+                             "sync-error exceeds 300 ns (normal during startup)");
+            //printk(KERN_INFO "shprd.sync: init PI-Tuning is: %d, %d (inverted k-values x1024)",
+            //       kp_inv_n10_init, ki_inv_n10_init);
+        }
         info_count = 0;
+        /* val = 200 prints every 20s when enabled */
+        printk(KERN_INFO "shprd.sync: err_PI = %lld (%d), %lld -> fback = %lld ns/.1s [%u; %u]",
+               error, sync_state.input_smooth, sync_state.output_sum, output, sync_reply->value[0],
+               sync_reply->value[1]);
     }
+
+    /* test for validity */
+    if ((input_now > (int32_t) (SYNC_INTERVAL_NS / 2)) ||
+        (input_now < -(int32_t) (SYNC_INTERVAL_NS / 2)))
+        printk(KERN_ERR "shprd.sync: input (P) is out of bound (%d ns) -> BUG", input_now);
 
     /* plausibility-check, in case the sync-algo produces jumps */
     if (ts_previous_ns > 0)
     {
         int64_t diff_timestamp_ms = div_s64((int64_t) ts_upcoming_ns - ts_previous_ns, 1000000u);
         if (diff_timestamp_ms < 0)
-            printk(KERN_ERR "shprd.k: backwards timestamp-jump detected (sync-loop, %lld ms)",
+            printk(KERN_ERR "shprd.sync: backwards timestamp-jump detected (sync-loop, %lld ms)",
                    diff_timestamp_ms);
         else if (diff_timestamp_ms < 95)
-            printk(KERN_ERR "shprd.k: too small timestamp-jump detected (sync-loop, %lld ms)",
+            printk(KERN_ERR "shprd.sync: too small timestamp-jump detected (sync-loop, %lld ms)",
                    diff_timestamp_ms);
         else if (diff_timestamp_ms > 105)
-            printk(KERN_ERR "shprd.k: forwards timestamp-jump detected (sync-loop, %lld ms)",
+            printk(KERN_ERR "shprd.sync: forwards timestamp-jump detected (sync-loop, %lld ms)",
                    diff_timestamp_ms);
         else if (ts_upcoming_ns == 0)
-            printk(KERN_ERR "shprd.k: zero timestamp detected (sync-loop)");
+            printk(KERN_ERR "shprd.sync: zero timestamp detected (sync-loop)");
     }
-    ts_previous_ns                = ts_upcoming_ns;
-    sync_reply->next_timestamp_ns = ts_upcoming_ns;
-
-    if ((sync_reply->buffer_block_period > TIMER_BASE_PERIOD + 80000) ||
-        (sync_reply->buffer_block_period < TIMER_BASE_PERIOD - 80000))
-        printk(KERN_ERR "shprd.k: buffer_block_period out of limits (%u instead of ~20M)",
-               sync_reply->buffer_block_period);
-    if ((sync_reply->analog_sample_period > SAMPLE_PERIOD + 10) ||
-        (sync_reply->analog_sample_period < SAMPLE_PERIOD - 10))
-        printk(KERN_ERR "shprd.k: analog_sample_period out of limits (%u instead of ~2000)",
-               sync_reply->analog_sample_period);
-
+    ts_previous_ns = ts_upcoming_ns;
     return 0;
 }

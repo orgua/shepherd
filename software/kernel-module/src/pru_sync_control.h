@@ -1,7 +1,7 @@
 #ifndef __PRU_SYNC_CONTROL_H_
 #define __PRU_SYNC_CONTROL_H_
 
-#include "commons.h"
+#include "_commons.h"
 
 /**
  * Initializes snychronization procedure between our Linux clock and PRU0
@@ -10,7 +10,7 @@
  * to the 'buffer period' and a phase aligned with the real time. This timer
  * triggers an interrupt on PRU0
  */
-int  sync_init(uint32_t timer_period_ns);
+int  sync_init(void);
 void sync_exit(void);
 void sync_reset(void);
 
@@ -35,7 +35,7 @@ void sync_start(void);
  * @param sync_reply fresh values for next 100ms-window
  * @param sync_rqst timed iep-counter-value that was received from PRU0
  */
-int  sync_loop(struct SyncMsg *sync_reply, const struct ProtoMsg *sync_rqst);
+int  sync_PID_correction(struct ProtoMsg *sync_reply, const struct ProtoMsg *sync_rqst);
 
 /**
  * Synchronization data structure
@@ -45,14 +45,11 @@ int  sync_loop(struct SyncMsg *sync_reply, const struct ProtoMsg *sync_rqst);
  */
 struct sync_data_s
 {
-    int64_t  error_now;
-    int64_t  error_pre;
-    int64_t  error_dif;
-    int64_t  error_sum;
-    int32_t  clock_corr;
-    uint32_t previous_period;
+    int64_t  output_sum;
+    int32_t  input_smooth;
+    uint32_t k_state;
+    int32_t  kp_inv_n10;
+    int32_t  ki_inv_n10;
 };
-
-extern struct sync_data_s *sync_data;
 
 #endif /* __PRU_SYNC_CONTROL_H_ */

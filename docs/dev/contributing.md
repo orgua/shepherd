@@ -123,7 +123,7 @@ Use `bump2version` to update the version number across the repository:
 ```shell
 pipenv shell
 pre-commit run --all-files
-bump2version --allow-dirty --new-version 0.8.4 patch
+bump2version --allow-dirty --new-version 0.9.0 patch
 # version-format: major.minor.patch
 ```
 

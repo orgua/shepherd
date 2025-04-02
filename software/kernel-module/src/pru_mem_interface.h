@@ -1,6 +1,6 @@
 #ifndef PRU_MEM_INTERFACE_H_
 #define PRU_MEM_INTERFACE_H_
-#include "commons.h"
+#include "_commons.h"
 
 /**
  * Initializes communication between our kernel module and the PRUs.
@@ -19,6 +19,9 @@ void               mem_interface_init(void);
 void               mem_interface_exit(void);
 
 void               mem_interface_reset(void);
+
+/* test the 11 canaries that are placed in shared-mem */
+uint32_t           mem_interface_check_canaries(void);
 /**
  * Trigger a system event on the PRUs
  *
@@ -69,20 +72,6 @@ enum ShepherdState mem_interface_get_state(void);
 void               mem_interface_set_state(enum ShepherdState state);
 
 /**
- * Reads the buffer period from the PRUs
- *
- * The 'buffer period' is a crucial parameter that, together with the number
- * of samples per buffer determines the sampling rate. It is defined in the
- * PRU firmware, but we need it to set the timer period that is used to
- * schedule samples on the PRUs.
- *
- * @see sync_init()
- *
- * @returns Buffer period in nanoseconds
- */
-unsigned int       mem_interface_get_buffer_period_ns(void);
-
-/**
  * Receives Sync-Messages from PRU1
  * @param msg
  * @return success = 1, error = 0
@@ -93,7 +82,7 @@ unsigned char      pru1_comm_receive_sync_request(struct ProtoMsg *const msg);
  * @param msg
  * @return success = 1, error = 0
  */
-unsigned char      pru1_comm_send_sync_reply(struct SyncMsg *const msg);
+unsigned char      pru1_comm_send_sync_reply(struct ProtoMsg *const msg);
 
 /*
  * COM-System between kernel module and PRU0

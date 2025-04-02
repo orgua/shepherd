@@ -85,6 +85,6 @@ jobs:
 
       - name: Build SBW Programmer 🧱
         run: |
-          make PROTO=SBW
+          make TYPE=SBW
           ${{ env.PRU_GCC }}/bin/pru-size gen_gcc/pru0-programmer-SBW-fw.elf
         working-directory: "software/firmware/pru0-programmer/"

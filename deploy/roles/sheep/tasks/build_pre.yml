@@ -12,7 +12,7 @@
   register: modprobe_ret
   until: modprobe_ret is not failed
   retries: 5
-  when: kmod_ret.rc == 0
+  # when: kmod_ret.rc == 0 # NOT WORKING as expected
   changed_when: true
   # fails at least on first install -> check for presence of shepherd
   # lsmod | grep shepherd

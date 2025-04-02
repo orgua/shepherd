@@ -1,3 +1,4 @@
+import math
 import time
 from collections.abc import Generator
 from pathlib import Path
@@ -6,6 +7,7 @@ import h5py
 import numpy as np
 import pytest
 from shepherd_core import CalibrationCape
+from shepherd_core import CalibrationPair
 from shepherd_core import CalibrationSeries
 from shepherd_core import Reader as CoreReader
 from shepherd_core.data_models import VirtualSourceConfig
@@ -13,11 +15,10 @@ from shepherd_core.data_models.task import EmulationTask
 from shepherd_core.data_models.testbed import TargetPort
 from shepherd_sheep import ShepherdDebug
 from shepherd_sheep import ShepherdEmulator
-from shepherd_sheep import ShepherdIOError
 from shepherd_sheep import Writer
+from shepherd_sheep import commons
 from shepherd_sheep import run_emulator
-from shepherd_sheep import sysfs_interface
-from shepherd_sheep.shared_memory import DataBuffer
+from shepherd_sheep.shared_memory import IVTrace
 
 
 def random_data(length: int) -> np.ndarray:
@@ -34,7 +35,7 @@ def src_cfg() -> VirtualSourceConfig:
 
 
 @pytest.fixture
-def data_h5(tmp_path: Path) -> Path:
+def data_h5(tmp_path: Path, duration_s: float = 10.0) -> Path:
     store_path = tmp_path / "record_example.h5"
     with Writer(
         store_path,
@@ -42,10 +43,12 @@ def data_h5(tmp_path: Path) -> Path:
         force_overwrite=True,
     ) as store:
         store.store_hostname("Inky")
-        for i in range(100):
+        for i in range(round(10 * duration_s)):
             len_ = 10_000
-            mock_data = DataBuffer(random_data(len_), random_data(len_), i)
-            store.write_buffer(mock_data)
+            mock_data = IVTrace(
+                voltage=random_data(len_), current=random_data(len_), timestamp_ns=i
+            )
+            store.write_iv_buffer(mock_data)
     return store_path
 
 
@@ -89,20 +92,22 @@ def test_emulation(
     emulator: ShepherdEmulator,
 ) -> None:
     emulator.start(wait_blocking=False)
-    fifo_buffer_size = sysfs_interface.get_n_buffers()
     emulator.wait_for_start(15)
-    for _, dsv, dsc in shp_reader.read_buffers(start_n=fifo_buffer_size, is_raw=True):
-        idx, emu_buf = emulator.get_buffer()
-        writer.write_buffer(emu_buf)
-        hrv_buf = DataBuffer(voltage=dsv, current=dsc)
-        emulator.return_buffer(idx, hrv_buf)
+    for _, dsv, dsc in shp_reader.read_buffers(start_n=emulator.buffer_segment_count, is_raw=True):
+        while not emulator.shared_mem.can_fit_iv_segment():
+            _data = emulator.shared_mem.read_buffer_iv()
+            if _data:
+                writer.write_iv_buffer(_data)
+            else:
+                time.sleep(emulator.segment_period_s / 2)
+        emulator.shared_mem.write_buffer_iv(data=IVTrace(voltage=dsv, current=dsc))
 
-    for _ in range(fifo_buffer_size):
-        idx, emu_buf = emulator.get_buffer()
-        writer.write_buffer(emu_buf)
-
-    with pytest.raises(ShepherdIOError):
-        _, _ = emulator.get_buffer()
+    for _ in range(emulator.buffer_segment_count):
+        _data = emulator.shared_mem.read_buffer_iv()
+        if _data:
+            writer.write_iv_buffer(_data)
+        else:
+            time.sleep(emulator.segment_period_s / 2)
 
 
 @pytest.mark.hardware
@@ -175,3 +180,106 @@ def test_target_pins() -> None:
             response = int(shepherd_io.gpi_read())
             assert response & (2 ** pru_responses[io_index])
     # TODO: could add a loopback for uart, but extra hardware is needed for that
+
+
+@pytest.mark.usefixtures("_shepherd_up")
+def test_cache_via_loopback(tmp_path: Path) -> None:
+    # generate 2.5 buffers of random data
+    duration_s = 2.5e-3 * commons.BUFFER_IV_INTERVAL_MS
+    path_input = data_h5(tmp_path, duration_s=duration_s)
+    path_output = tmp_path / "loopback.h5"
+
+    # run loopback and write to second file
+    with (
+        ShepherdDebug() as shepherd_io,
+        CoreReader(path_input) as reader,
+        Writer(path_output, mode="emulator", datatype="ivsample", force_overwrite=True) as writer,
+    ):
+        shepherd_io.switch_shepherd_mode("emu_loopback")
+
+        # essentials of emulator.init()
+        cal_inp = reader.get_calibration_data()
+        if cal_inp is None:
+            cal_inp = CalibrationSeries()
+            print(
+                "No calibration data from emulation-input (harvest) provided - using defaults",
+            )
+        cal_pru = CalibrationSeries(
+            voltage=CalibrationPair(
+                gain=1e6 * cal_inp.voltage.gain,
+                offset=1e6 * cal_inp.voltage.offset,
+                unit="V",
+            ),
+            current=CalibrationPair(
+                gain=1e9 * cal_inp.current.gain,
+                offset=1e9 * cal_inp.current.offset,
+                unit="A",
+            ),
+        )
+
+        # essentials of emulator.enter()
+        # Preload emulator with data
+        samples_per_buffer = 10_000
+        buffer_segment_count = math.floor(commons.BUFFER_IV_SIZE // samples_per_buffer)
+        print("Begin initial fill of IV-Buffer (n=%d segments)", buffer_segment_count)
+        for _, dsv, dsc in reader.read_buffers(
+            end_n=buffer_segment_count,
+            is_raw=True,
+            omit_ts=True,
+        ):
+            if not shepherd_io.shared_mem.can_fit_iv_segment():
+                raise BufferError("Not enough space in buffer during initial fill.")
+            shepherd_io.shared_mem.write_buffer_iv(
+                data=IVTrace(voltage=dsv, current=dsc),
+                cal=cal_pru,
+                verbose=False,
+            )
+
+        # essentials of emulator.run()
+        shepherd_io.start(wait_blocking=True)
+        shepherd_io.handle_pru_messages()
+        ts_end = None
+        for _, dsv, dsc in reader.read_buffers(
+            start_n=buffer_segment_count,
+            is_raw=True,
+            omit_ts=True,
+        ):
+            while not shepherd_io.shared_mem.can_fit_iv_segment():
+                data_iv = shepherd_io.shared_mem.read_buffer_iv()
+                data_gp = shepherd_io.shared_mem.read_buffer_gpio()
+                data_ut = shepherd_io.shared_mem.read_buffer_util()
+
+                writer.write_gpio_buffer(data_gp)
+                writer.write_util_buffer(data_ut)
+
+                if data_iv:
+                    if ts_end is None:
+                        ts_end = data_iv.timestamp() + duration_s
+                    if data_iv.timestamp() >= ts_end:
+                        print("FINISHED! Out of bound timestamp collected -> begin to exit now")
+                        break
+                    ts_data_last = time.time()
+                    if writer is not None:
+                        try:
+                            self.writer.write_iv_buffer(data_iv)
+                        except OSError as _xpt:
+                            log.error(
+                                "Failed to write data to HDF5-File - will STOP! error = %s",
+                                _xpt,
+                            )
+                            return
+
+                # TODO: implement cleaner exit (pru-statechange or end-timestamp
+
+                self.handle_pru_messages()
+                if not (data_iv or data_gp or data_ut):
+                    if ts_data_last - time.time() > 10:
+                        log.error("Main sheep-routine ran dry for 10s, will STOP")
+                        break
+                    # rest of loop is non-blocking, so we better doze a while if nothing to do
+                    time.sleep(self.segment_period_s / 10)
+            self.shared_mem.write_buffer_iv(
+                data=IVTrace(voltage=dsv, current=dsc),
+                cal=self.cal_pru,
+                verbose=self.verbose_extra,
+            )

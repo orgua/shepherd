@@ -28,7 +28,8 @@ ASSERT(dac_convert, DAC_mV_2_raw(DAC_MAX_mV) <= DAC_MAX_VAL);
 
 /* ADS8691 Register Config */
 #define REGISTER_WRITE  (0b11010000u << 24u)
-#define REGISTER_READ   (0b01001000u << 24u)
+#define REGISTER_READ   (0b11001000u << 24u) /* lower half word */
+//#define REGISTER_READ   (0b01001000u << 24u)  /* full u32 */
 
 #define ADDR_REG_PWRCTL (0x04u << 16u)
 #define WRITE_KEY       (0x69u << 8u)
@@ -38,7 +39,7 @@ ASSERT(dac_convert, DAC_mV_2_raw(DAC_MAX_mV) <= DAC_MAX_VAL);
 
 #define ADDR_REG_RANGE  (0x14u << 16u)
 #define RANGE_SEL_P125  (0b00001011u) // only positive
-#define RANGE_SEL_125   (0b00001011u) // +- 1.25 VRef
+#define RANGE_SEL_125   (0b00000011u) // +- 1.25 VRef,
 
 #define ADC_V_LSB       (19.5313e-6)
 #define ADC_C_LSB       (195.313e-9)
